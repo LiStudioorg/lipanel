@@ -70,6 +70,13 @@ var ErrAlreadyRunning = errors.New("plugin: 插件已在运行中")
 // ErrUnsupported 表示插件不支持该操作（例如 external 模式无法由核心停止）。
 var ErrUnsupported = errors.New("plugin: 该插件不支持此操作")
 
+// ErrPermissionDenied 表示插件未声明本次调用所需的权限，请求被核心拒绝。
+//
+// 注意（能力边界）：这是**面板转发通道**上的拒绝，不是内核级沙箱。
+// 它阻止的是「浏览器经核心转发去调用插件接口」，无法阻止插件进程
+// 自己去读文件或执行命令。详见 permission.go 文件头。
+var ErrPermissionDenied = errors.New("plugin: 插件未声明该操作所需的权限")
+
 // Frontend 描述插件的前端挂载信息，是「插件前端动态挂载」的契约。
 //
 // 阶段三 3.1 里 Entry 只是前端静态注册表（web/src/plugins/registry.js）
@@ -133,6 +140,19 @@ type Descriptor struct {
 	Builtin bool `json:"builtin"`
 	// Mode 是运行模式，见 ModeManaged / ModeExternal。
 	Mode string `json:"mode"`
+	// Permissions 是插件声明的权限清单（阶段三 3.3）。
+	//
+	// 语法见 [ParsePermission]：`<域>.<动作>[:<资源>]`，
+	// 例如 ["system.read", "process.read", "file.read:/etc/nginx"]。
+	//
+	// **能力边界（重要）**：声明约束的是「核心转发给插件的调用」——
+	// 未声明的操作会被核心以 403 拒绝，请求根本到不了插件进程。
+	// 它**不是内核级沙箱**，无法阻止插件进程直接读文件或执行命令。
+	// 详见 permission.go 文件头，切勿据此产生虚假的安全感。
+	//
+	// 为空表示插件不声明任何权限：此时除骨架接口（/healthz、/whoami）
+	// 与前端资源外，一切转发调用都会被拒绝（默认拒绝）。
+	Permissions []string `json:"permissions,omitempty"`
 	// Frontend 是前端挂载信息。
 	Frontend Frontend `json:"frontend"`
 }
@@ -155,6 +175,11 @@ func (d Descriptor) Validate() error {
 		return fmt.Errorf("plugin: %s 缺少 Mode", d.ID)
 	default:
 		return fmt.Errorf("plugin: %s 的 Mode = %q 非法，可选 %s|%s", d.ID, d.Mode, ModeManaged, ModeExternal)
+	}
+	// 权限声明在注册阶段就解析：写错的权限不该等到被点击时才暴露。
+	// 解析结果由 Manager 缓存，运行期拦截不必重复解析。
+	if _, err := ParsePermissions(d.Permissions); err != nil {
+		return fmt.Errorf("plugin: %s 的权限声明非法: %w", d.ID, err)
 	}
 	return nil
 }

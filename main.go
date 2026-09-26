@@ -97,6 +97,10 @@ func run() error {
 
 		pluginSocketDir = flag.String("plugin-socket-dir", "",
 			"插件 Unix socket 存放目录（留空则使用 <临时目录>/lipanel-plugins，权限 0700）")
+		pluginAuditLog = flag.String("audit-log", "",
+			"插件操作审计日志路径（JSONL，追加写入，权限 0600）；留空则审计只保留在内存中")
+		pluginAuditBuf = flag.Int("audit-buffer", plugin.DefaultAuditCapacity,
+			"插件操作审计在内存中保留的条数上限（供审计页查询）")
 	)
 	flag.Parse()
 
@@ -157,9 +161,23 @@ func run() error {
 	}
 
 	// 插件管理器：注册全部内置插件，并把 socket 目录放在私有目录下。
+	//
+	// 审计器在管理器之前构造：审计路径打不开时应当在启动阶段就报错，
+	// 而不是让用户在「以为有审计」的状态下运行。
+	auditor, err := plugin.NewAuditor(plugin.AuditOptions{
+		Capacity: *pluginAuditBuf,
+		Path:     *pluginAuditLog,
+		Logger:   logger,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = auditor.Close() }()
+
 	pluginManager, err := plugin.NewManager(plugin.Options{
 		SocketDir: *pluginSocketDir,
 		Logger:    logger,
+		Audit:     auditor,
 	})
 	if err != nil {
 		return err
@@ -171,6 +189,8 @@ func run() error {
 		"builtin_count", len(plugin.BuiltinIDs()),
 		"plugins", plugin.BuiltinIDs(),
 		"socket_dir", pluginManager.SocketDir(),
+		"audit_log", *pluginAuditLog,
+		"audit_buffer", *pluginAuditBuf,
 	)
 
 	// 注入内嵌前端资源（go:embed 在根目录，见本文件顶部 distFS）。

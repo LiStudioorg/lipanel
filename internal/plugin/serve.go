@@ -108,8 +108,17 @@ func Serve(h Handler, logger *slog.Logger) error {
 	registerAssetRoutes(mux, h, desc, logger)
 	h.Routes(mux)
 
+	// 纵深防御：插件侧对自己的业务路由再做一次权限自检。
+	// 核心已经拦过一道，这里再拦一道的价值在于：
+	// 万一将来有人绕过核心直接连 socket（同机 root、或核心出现漏洞），
+	// 插件自己仍然拒绝未声明的操作。
+	//
+	// 注意这不是安全边界的补强：同机 root 本来就能改 socket 权限、
+	// 直接 ptrace 插件进程。它只是「多做一层成本极低的检查」。
+	handler := withPermissionSelfCheck(mux, desc, logger)
+
 	srv := &http.Server{
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -153,6 +162,58 @@ func Serve(h Handler, logger *slog.Logger) error {
 		logger.Info("插件已退出", "plugin", desc.ID)
 		return nil
 	}
+}
+
+// withPermissionSelfCheck 在插件侧对业务路由做一次权限自检（纵深防御）。
+//
+// 校验所需的权限集合来自**插件自身编译进去的 Descriptor**，
+// 而不是环境变量或请求头——那些都是可被篡改的外部输入，
+// 拿它们做校验等于把锁的钥匙交给被锁的人。
+//
+// 与核心侧的拦截同一套规则（RequiredPermission / PermissionSet.Has），
+// 因此两侧的判定不会出现分歧：同一个路径在核心侧放行、在插件侧也放行。
+func withPermissionSelfCheck(next http.Handler, desc Descriptor, logger *slog.Logger) http.Handler {
+	own, err := ParsePermissions(desc.Permissions)
+	if err != nil {
+		// 声明在 Serve 开头已通过 Validate 校验，走到这里属编程错误。
+		// 不 panic：插件应有的行为是「启动失败并说清原因」，
+		// 而不是把一个看不懂的栈抛给用户。
+		logger.Error("插件自身的权限声明无法解析，将拒绝所有业务路由",
+			"plugin", desc.ID, "err", err)
+		own = PermissionSet{}
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		required, needCheck := RequiredPermission(r.Method, r.URL.Path)
+		if needCheck && !own.Has(required) {
+			logger.Warn("插件侧权限自检拒绝请求（未声明该权限）",
+				"plugin", desc.ID, "method", r.Method, "path", r.URL.Path,
+				"required", required, "granted", own.Strings())
+			writePluginJSON(w, logger, http.StatusForbidden, map[string]any{
+				"error":    "插件未声明该操作所需的权限",
+				"code":     "plugin_permission_denied",
+				"plugin":   desc.ID,
+				"required": required,
+				"granted":  own.Strings(),
+				"scope": "该限制作用于核心的转发通道，不是内核级沙箱；" +
+					"它无法阻止插件进程直接访问系统资源。",
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ExportPermissionSelfCheckForTest 暴露插件侧权限自检，供外部测试包
+// （plugin_test）覆盖真实实现。
+//
+// 为什么需要它：withPermissionSelfCheck 是包内私有函数，而验证
+// 「插件自己也会拒绝未声明的权限」必须构造真实插件实例
+// （sysinfo 需要 import 本包，只能用外部测试包，见 builtin_test.go 的说明）。
+// 若让测试另写一份自检逻辑，测的就不是线上那份代码了。
+// 名字带 ForTest 是明确它不属于对外 API。
+func ExportPermissionSelfCheckForTest(next http.Handler, desc Descriptor, logger *slog.Logger) http.Handler {
+	return withPermissionSelfCheck(next, desc, logger)
 }
 
 // removeStaleSocket 清理残留的 socket 文件。

@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"lipanel/internal/plugin"
@@ -47,6 +48,12 @@ func (s *Server) registerPluginRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/plugins/{id}/restart", s.auth.RequireAuth(http.HandlerFunc(s.handlePluginRestart)))
 	mux.Handle("POST /api/plugins/{id}/health", s.auth.RequireAuth(http.HandlerFunc(s.handlePluginHealth)))
 
+	// 审计接口（阶段三 3.3）。必须在 "/api/plugins/{id}/" 通配之前注册，
+	// 否则 "/api/plugins/audit" 会被当成插件 ID = "audit" 的转发请求。
+	mux.Handle("GET /api/plugins/audit", s.auth.RequireAuth(http.HandlerFunc(s.handleAuditLog)))
+	mux.Handle("GET /api/plugins/{id}/audit", s.auth.RequireAuth(http.HandlerFunc(s.handlePluginAudit)))
+	mux.Handle("GET /api/plugins/{id}/permissions", s.auth.RequireAuth(http.HandlerFunc(s.handlePluginPermissions)))
+
 	// 转发兜底：任何其它 /api/plugins/{id}/xxx 都交给插件自己处理。
 	// 这条必须最后注册，且必须保留结尾斜杠才能匹配子路径。
 	mux.Handle("/api/plugins/{id}/", s.auth.RequireAuth(http.HandlerFunc(s.handlePluginProxy)))
@@ -67,6 +74,8 @@ type pluginListResponse struct {
 	Running int `json:"running"`
 	// SocketDir 是插件 socket 目录，便于排查部署问题（需登录才可见）。
 	SocketDir string `json:"socket_dir"`
+	// Audit 是审计器状态，供插件管理页展示「审计是否在记录」。
+	Audit plugin.AuditStats `json:"audit"`
 }
 
 // handlePluginList 返回全部插件及其实时状态。
@@ -85,6 +94,7 @@ func (s *Server) handlePluginList(w http.ResponseWriter, r *http.Request) {
 		Total:     len(list),
 		Running:   running,
 		SocketDir: s.plugins.SocketDir(),
+		Audit:     s.plugins.Audit().Stats(),
 	})
 }
 
@@ -232,6 +242,130 @@ func pluginSubPath(fullPath, id string) (string, bool) {
 		return "", false
 	}
 	return rest, true
+}
+
+// handlePluginPermissions 返回某插件声明并已被核心接受的权限清单。
+//
+// 单独一个接口而不是塞进 /api/plugins/{id} 的响应里，是为了让它
+// 独立可测、也让「查权限」这件事在插件页上能单独刷新。
+func (s *Server) handlePluginPermissions(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	st, err := s.plugins.Get(id)
+	if err != nil {
+		s.writePluginError(w, err, id)
+		return
+	}
+	perms, err := s.plugins.Permissions(id)
+	if err != nil {
+		s.writePluginError(w, err, id)
+		return
+	}
+
+	declared := make([]string, 0, len(perms))
+	for _, p := range perms {
+		declared = append(declared, p.Raw)
+	}
+
+	writeJSON(w, s.logger, http.StatusOK, map[string]any{
+		"plugin":      id,
+		"permissions": declared,
+		// declared_note 把「声明到底管什么」直接写进响应里：
+		// 前端可以把这句话原样展示给用户，避免被理解成内核级沙箱。
+		"scope_note": "权限声明约束的是「核心转发给该插件的调用」：" +
+			"未声明的操作会被核心以 403 拒绝，请求不会到达插件进程。" +
+			"它不是内核级沙箱，无法阻止插件进程直接读取文件或执行命令。",
+		"state": st.State,
+	})
+}
+
+// handleAuditLog 返回全局审计记录（支持 ?plugin= / ?outcome= / ?limit= 过滤）。
+func (s *Server) handleAuditLog(w http.ResponseWriter, r *http.Request) {
+	if s.plugins == nil {
+		s.handlePluginsUnavailable(w, r)
+		return
+	}
+
+	query := r.URL.Query()
+	filter := plugin.AuditFilter{
+		Plugin:  strings.TrimSpace(query.Get("plugin")),
+		Outcome: strings.TrimSpace(query.Get("outcome")),
+		Limit:   parseAuditLimit(query.Get("limit")),
+	}
+	s.writeAuditResponse(w, filter)
+}
+
+// handlePluginAudit 返回单个插件的审计记录。
+func (s *Server) handlePluginAudit(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !plugin.ValidID(id) {
+		writeJSON(w, s.logger, http.StatusBadRequest, map[string]string{
+			"error": "非法插件 ID: " + id,
+		})
+		return
+	}
+	// 插件必须存在：否则 /api/plugins/<乱写>/audit 会静默返回空列表，
+	// 用户会以为「这个插件什么都没干」，而不是「根本没有这个插件」。
+	if _, err := s.plugins.Get(id); err != nil {
+		s.writePluginError(w, err, id)
+		return
+	}
+
+	query := r.URL.Query()
+	s.writeAuditResponse(w, plugin.AuditFilter{
+		Plugin:  id,
+		Outcome: strings.TrimSpace(query.Get("outcome")),
+		Limit:   parseAuditLimit(query.Get("limit")),
+	})
+}
+
+// writeAuditResponse 输出审计记录 + 统计信息。
+//
+// 记录与统计一起返回：前端表格要显示条目，顶部还要显示
+// 「累计 N 条 / 拒绝 M 条」，分两次请求纯属浪费。
+func (s *Server) writeAuditResponse(w http.ResponseWriter, filter plugin.AuditFilter) {
+	auditor := s.plugins.Audit()
+
+	writeJSON(w, s.logger, http.StatusOK, map[string]any{
+		"events": auditor.Query(filter),
+		"stats":  auditor.Stats(),
+		// by_plugin 让插件列表能显示每个插件的拒绝次数，
+		// 而不必为每个插件单独请求一次审计接口。
+		"by_plugin": auditor.CountByPlugin(),
+		"filter": map[string]any{
+			"plugin":  filter.Plugin,
+			"outcome": filter.Outcome,
+			"limit":   effectiveAuditLimit(filter.Limit),
+		},
+	})
+}
+
+// parseAuditLimit 解析 ?limit= 参数。
+//
+// 非法值一律回落到默认值而不是报错：审计页是排查工具，
+// 一个写错的查询参数不该让整个页面打不开。
+// 上限由 plugin.MaxAuditQueryLimit 在 Auditor 内部统一 clamp。
+func parseAuditLimit(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0 // 交给 Auditor 用默认值
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// effectiveAuditLimit 回显最终生效的条数上限（与 Auditor 的 clamp 规则一致）。
+func effectiveAuditLimit(limit int) int {
+	if limit <= 0 {
+		return plugin.DefaultAuditQueryLimit
+	}
+	if limit > plugin.MaxAuditQueryLimit {
+		return plugin.MaxAuditQueryLimit
+	}
+	return limit
 }
 
 // writePluginError 把插件包返回的错误翻译成合适的 HTTP 状态码。

@@ -37,6 +37,9 @@ type Options struct {
 	// DisableWatcher 为 true 时不自动监测插件崩溃。
 	// 仅供测试使用（避免测试进程被异步回调干扰）。
 	DisableWatcher bool
+	// Audit 为 nil 时新建一个仅内存的审计器（容量 DefaultAuditCapacity）。
+	// 由 main 注入以支持 -audit-log 落盘；测试可注入自定义实例以断言记录内容。
+	Audit *Auditor
 }
 
 // entry 是注册表中一个插件条目的运行时记录。
@@ -44,6 +47,8 @@ type entry struct {
 	desc Descriptor
 	// sockPath 是该插件监听的 socket 路径（托管与外部模式共用）。
 	sockPath string
+	// perms 是解析后的权限集合（注册时解析一次，运行期直接复用）。
+	perms PermissionSet
 	// proc 仅在 managed 模式下非 nil。
 	proc *process
 
@@ -72,6 +77,7 @@ type Manager struct {
 	logger   *slog.Logger
 	sockDir  string
 	binPath  string
+	audit    *Auditor
 	mu       sync.RWMutex
 	registry map[string]*entry
 	// order 保留注册顺序，让 /api/plugins 的列表稳定可预期
@@ -116,13 +122,36 @@ func NewManager(opts Options) (*Manager, error) {
 		logger.Warn("收紧 socket 目录权限失败", "dir", opts.SocketDir, "err", err)
 	}
 
+	// 审计器：未注入时建一个纯内存的。
+	// 这里用内存兜底而不是 nil，是为了让权限拒绝这类事件**永远有记录**——
+	// 一个"没有审计"的默认状态会让排查越权问题时两手空空。
+	auditor := opts.Audit
+	if auditor == nil {
+		var err error
+		auditor, err = NewAuditor(AuditOptions{Logger: logger})
+		if err != nil {
+			return nil, fmt.Errorf("plugin: 初始化审计器失败: %w", err)
+		}
+	}
+
 	return &Manager{
 		opts:     opts,
 		logger:   logger,
 		sockDir:  opts.SocketDir,
 		binPath:  binPath,
+		audit:    auditor,
 		registry: make(map[string]*entry),
 	}, nil
+}
+
+// Audit 返回审计器，供 server 层查询记录与统计。
+// 永不返回 nil（NewManager 保证）。
+func (m *Manager) Audit() *Auditor { return m.audit }
+
+// Close 释放审计器持有的文件句柄。
+// 由 main 在退出时调用；重复调用幂等。
+func (m *Manager) Close() error {
+	return m.audit.Close()
 }
 
 // SocketDir 返回 socket 目录，便于日志与测试断言。
@@ -138,6 +167,13 @@ func (m *Manager) Register(desc Descriptor) error {
 		return err
 	}
 
+	// 注册时解析一次权限，运行期拦截直接复用解析结果。
+	// 解析失败已在 Validate 中拦截过，这里的错误是理论上的兜底。
+	perms, err := ParsePermissions(desc.Permissions)
+	if err != nil {
+		return fmt.Errorf("plugin: %s 的权限声明非法: %w", desc.ID, err)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -148,6 +184,7 @@ func (m *Manager) Register(desc Descriptor) error {
 	e := &entry{
 		desc:     desc,
 		sockPath: filepath.Join(m.sockDir, desc.ID+".sock"),
+		perms:    perms,
 		state:    StateStopped,
 	}
 	if desc.Mode == ModeManaged {
@@ -157,8 +194,96 @@ func (m *Manager) Register(desc Descriptor) error {
 	m.order = append(m.order, desc.ID)
 
 	m.logger.Info("插件已注册",
-		"plugin", desc.ID, "name", desc.Name, "version", desc.Version, "mode", desc.Mode)
+		"plugin", desc.ID, "name", desc.Name, "version", desc.Version, "mode", desc.Mode,
+		"permissions", perms.Strings(), "permission_count", perms.Len())
+
+	// 注册即记录一条审计：插件的权限清单是安全审计的重要上下文，
+	// 事后排查「它当初声明了什么」必须有据可查。
+	m.audit.Record(AuditEvent{
+		Plugin:  desc.ID,
+		Method:  "REGISTER",
+		Path:    "-",
+		Granted: perms.Strings(),
+		Outcome: AuditAllowed,
+		Status:  0,
+		Reason:  fmt.Sprintf("插件注册，声明权限 %d 条", perms.Len()),
+	})
+
 	return nil
+}
+
+// Permissions 返回指定插件已解析的权限声明。
+func (m *Manager) Permissions(id string) ([]Permission, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	e, ok := m.registry[id]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, id)
+	}
+	return e.perms.List(), nil
+}
+
+// CheckAccess 校验某插件是否可以访问指定子路径，**并记录审计**。
+//
+// 这是权限体系的唯一入口：Proxy 转发前调用它，返回 denied 时请求
+// 不会被转发给插件进程。把「校验 + 审计」放在同一个方法里，
+// 是为了从结构上保证「不会有绕过审计的校验」与「不会有没校验的转发」。
+//
+// 参数 clientIP 只用于审计记录（谁点的这一下）。
+func (m *Manager) CheckAccess(id, method, subPath, clientIP string) (PermissionDecision, PermissionSet) {
+	m.mu.RLock()
+	e, ok := m.registry[id]
+	var perms PermissionSet
+	if ok {
+		perms = e.perms
+	}
+	m.mu.RUnlock()
+
+	if !ok {
+		// 插件不存在：交给上层返回 404，这里不记审计
+		// （否则一个扫描器就能把审计缓冲刷满）。
+		return PermissionDecision{Allowed: false, Reason: "插件不存在: " + id}, perms
+	}
+
+	dec := CheckPermission(id, perms, method, subPath)
+	if dec.Allowed {
+		// 放行的请求不在这里记审计：转发完成后才知道最终结果
+		// （200 还是 502 是两回事），由 Proxy 在收尾时补记。
+		return dec, perms
+	}
+
+	m.logger.Warn("插件权限校验未通过，请求已被拒绝",
+		"plugin", id, "method", method, "path", subPath,
+		"required", dec.Required, "granted", perms.Strings())
+
+	m.audit.Record(AuditEvent{
+		Plugin:   id,
+		Method:   method,
+		Path:     subPath,
+		Required: dec.Required,
+		Granted:  perms.Strings(),
+		Outcome:  AuditDenied,
+		Status:   403,
+		ClientIP: clientIP,
+		Reason:   dec.Reason,
+	})
+	return dec, perms
+}
+
+// RecordAccess 记录一条已放行（或转发失败）的审计记录。
+//
+// 由 Proxy 在转发收尾时调用：此时才知道真实状态码与耗时。
+func (m *Manager) RecordAccess(ev AuditEvent) {
+	if ev.Granted == nil {
+		if perms, err := m.Permissions(ev.Plugin); err == nil {
+			ev.Granted = make([]string, 0, len(perms))
+			for _, p := range perms {
+				ev.Granted = append(ev.Granted, p.Raw)
+			}
+		}
+	}
+	m.audit.Record(ev)
 }
 
 // List 返回所有插件的状态快照，顺序与注册顺序一致。

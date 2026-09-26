@@ -111,7 +111,15 @@ func New(logger *slog.Logger) *Plugin {
 // Descriptor 返回插件元数据。
 //
 // Frontend 字段是「插件前端动态挂载」的契约：核心把它原样返回给前端，
-// 前端据此生成菜单项并动态 import 插件自带的 ESM 入口。
+// 前端据此生成菜单项并动态挂载插件自带的 ESM 入口。
+//
+// Permissions 字段是阶段三 3.3 的「插件权限声明」：本插件需要的能力
+// 在此如实申报，核心据此拒绝未声明的转发调用（403，请求到不了插件进程）。
+//
+// ⚠️ 能力边界（勿产生误解）：声明约束的是**面板转发通道**，
+// 不是内核级沙箱。本插件进程依然可以自由读 /proc、执行命令——
+// 声明的作用是「向用户申报 + 让核心能拒绝越权调用」，不是「限制进程行为」。
+// 详见 internal/plugin/permission.go 文件头。
 func (p *Plugin) Descriptor() plugin.Descriptor {
 	return plugin.Descriptor{
 		ID:          ID,
@@ -120,6 +128,13 @@ func (p *Plugin) Descriptor() plugin.Descriptor {
 		Description: "通过独立插件进程采集 CPU / 内存 / 磁盘信息，用于验证插件通讯链路与前端动态挂载。",
 		Builtin:     true,
 		Mode:        plugin.ModeManaged,
+		// 权限声明：本插件只读系统信息，因此只申请两项只读权限。
+		// 刻意不申请 file.* / process.exec 等更强权限——一个只做展示的
+		// 插件永远不该持有写文件或执行命令的能力，这是最小权限原则的落地。
+		Permissions: []string{
+			"system.read",  // 读 /proc 里的 CPU / 内存 / 磁盘信息
+			"process.read", // 上报自身进程信息（/runtime：PID、线程数、运行时长）
+		},
 		Frontend: plugin.Frontend{
 			// Entry 是插件自带前端的 ESM 入口地址。
 			// 核心会把它转发到本插件的 GET /assets/plugin.js。

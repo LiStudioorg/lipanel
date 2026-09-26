@@ -435,6 +435,230 @@ func TestLiveProxyPathTraversalBlocked(t *testing.T) {
 	}
 }
 
+// TestLivePermissionAuditTrail 是阶段三 3.3 的端到端用例。
+//
+// 用**真实插件进程**跑通完整链路并检查审计留痕：
+//
+//	插件注册（记一条）→ 未运行时转发（503，记一条 failed）
+//	→ 启动 → 允许的 /info（200，记一条 allowed）
+//	→ 越权的 DELETE /files（403，记一条 denied，请求没到插件）
+//	→ 越权被拒后插件仍然正常运行（不影响其它功能）
+//
+// 为什么必须真拉进程：权限拦截与审计都是「转发通道」上的行为，
+// 而通道的另一端是不是真的活着（socket 是否就绪、插件是否响应）
+// 会直接影响状态码与审计结果。用 mock 测不出这些。
+func TestLivePermissionAuditTrail(t *testing.T) {
+	m := newLiveManager(t)
+
+	// --- 1. 注册阶段就应留下审计痕迹 ---
+	// 插件的权限清单是安全审计的重要上下文：事后排查「它当初声明了什么」
+	// 必须有据可查，因此 Manager.Register 会记一条。
+	afterRegister := m.Audit().Query(plugin.AuditFilter{Plugin: "sysinfo"})
+	if len(afterRegister) == 0 {
+		t.Fatal("注册插件应当留下一条审计记录（记录其权限清单）")
+	}
+	var sawRegister bool
+	for _, ev := range afterRegister {
+		if ev.Method == "REGISTER" {
+			sawRegister = true
+			if len(ev.Granted) == 0 {
+				t.Error("注册审计记录必须带上插件的权限清单")
+			}
+		}
+	}
+	if !sawRegister {
+		t.Error("审计里应当有一条 REGISTER 记录")
+	}
+
+	// 注册后立刻转发：插件未运行 → 503 → 审计 outcome=failed。
+	proxy := plugin.NewProxy(m)
+	rec := newRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	proxy.ServeHTTP(rec, req, "sysinfo", "/info")
+	if rec.status != http.StatusServiceUnavailable {
+		t.Fatalf("未运行时状态码 = %d, 期望 503", rec.status)
+	}
+
+	failed := m.Audit().Query(plugin.AuditFilter{Plugin: "sysinfo", Outcome: plugin.AuditFailed})
+	if len(failed) == 0 {
+		t.Fatal("转发因插件未运行而失败，应当在审计中记为 failed")
+	}
+	if failed[0].Status != http.StatusServiceUnavailable {
+		t.Errorf("failed 记录的 status = %d, 期望 503", failed[0].Status)
+	}
+
+	// --- 2. 启动插件，走一次允许的调用 ---
+	st, err := m.Start(context.Background(), "sysinfo")
+	if err != nil {
+		t.Fatalf("启动插件失败: %v", err)
+	}
+	if st.State != plugin.StateRunning {
+		t.Fatalf("启动后状态 = %q", st.State)
+	}
+
+	rec = newRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	proxy.ServeHTTP(rec, req, "sysinfo", "/info")
+	if rec.status != http.StatusOK {
+		t.Fatalf("GET /info 状态码 = %d, 期望 200（sysinfo 已声明 system.read）: %s",
+			rec.status, rec.body)
+	}
+
+	allowed := m.Audit().Query(plugin.AuditFilter{
+		Plugin:  "sysinfo",
+		Outcome: plugin.AuditAllowed,
+	})
+	var foundAllowed bool
+	for _, ev := range allowed {
+		if ev.Method == http.MethodGet && ev.Path == "/info" && ev.Status == http.StatusOK {
+			foundAllowed = true
+			if ev.Required != "system.read" {
+				t.Errorf("allowed 记录的 required = %q, 期望 system.read", ev.Required)
+			}
+			if ev.ClientIP != "127.0.0.1" {
+				t.Errorf("allowed 记录的 client_ip = %q, 期望 127.0.0.1", ev.ClientIP)
+			}
+		}
+	}
+	if !foundAllowed {
+		t.Errorf("成功的调用必须留下 allowed 审计记录，实际记录: %+v", allowed)
+	}
+
+	// --- 3. 越权调用：必须 403，且请求到不了插件 ---
+	// 用 DELETE /files（需要 file.write，sysinfo 未声明）。
+	before := m.Audit().Stats().Denied
+	rec = newRecorder()
+	req, _ = http.NewRequest(http.MethodDelete, "/", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	proxy.ServeHTTP(rec, req, "sysinfo", "/files/x.txt")
+	if rec.status != http.StatusForbidden {
+		t.Fatalf("越权调用状态码 = %d, 期望 403: %s", rec.status, rec.body)
+	}
+	if !strings.Contains(rec.body, "file.write") {
+		t.Errorf("403 响应应指明缺失的权限 file.write，实际: %s", rec.body)
+	}
+
+	denied := m.Audit().Query(plugin.AuditFilter{Plugin: "sysinfo", Outcome: plugin.AuditDenied})
+	if len(denied) == 0 {
+		t.Fatal("越权调用必须留下 denied 审计记录")
+	}
+	if denied[0].Required != "file.write" {
+		t.Errorf("denied 记录的 required = %q, 期望 file.write", denied[0].Required)
+	}
+	if after := m.Audit().Stats().Denied; after <= before {
+		t.Errorf("拒绝计数应当增加（before=%d after=%d）", before, after)
+	}
+
+	// --- 4. 关键性质：拒绝不影响插件本身的正常运行 ---
+	// 越权请求被拒之后，插件必须仍然活着、仍然正常响应合法请求。
+	// 这正是需求里「不影响主面板其他功能」的落点。
+	rec = newRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/", nil)
+	proxy.ServeHTTP(rec, req, "sysinfo", "/info")
+	if rec.status != http.StatusOK {
+		t.Errorf("越权被拒后，合法请求仍应 200，实际 %d", rec.status)
+	}
+
+	cur, err := m.Get("sysinfo")
+	if err != nil {
+		t.Fatalf("Get 失败: %v", err)
+	}
+	if cur.State != plugin.StateRunning {
+		t.Errorf("越权被拒后插件状态 = %q, 期望仍然 running", cur.State)
+	}
+	if cur.PID != st.PID {
+		t.Errorf("越权被拒不该导致插件重启（PID %d → %d）", st.PID, cur.PID)
+	}
+	if cur.LastError != "" {
+		t.Errorf("越权被拒不该写入插件的 LastError，实际: %q", cur.LastError)
+	}
+}
+
+// TestLiveAuditPersistJSONL 验证真实链路的审计会落盘。
+func TestLiveAuditPersistJSONL(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+
+	auditor, err := plugin.NewAuditor(plugin.AuditOptions{
+		Capacity: 100,
+		Path:     logPath,
+		Logger:   testLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewAuditor 失败: %v", err)
+	}
+
+	m, err := plugin.NewManager(plugin.Options{
+		SocketDir:      t.TempDir(),
+		ExecutablePath: buildTestBinary(t),
+		Logger:         testLogger(),
+		Audit:          auditor,
+		StartTimeout:   15 * time.Second,
+		StopTimeout:    5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewManager 失败: %v", err)
+	}
+	if err := m.RegisterAllBuiltins(); err != nil {
+		t.Fatalf("注册内置插件失败: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = m.Shutdown(ctx)
+	})
+
+	if _, err := m.Start(context.Background(), "sysinfo"); err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+
+	proxy := plugin.NewProxy(m)
+	rec := newRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	proxy.ServeHTTP(rec, req, "sysinfo", "/info")
+	if rec.status != http.StatusOK {
+		t.Fatalf("GET /info 状态码 = %d, 期望 200", rec.status)
+	}
+
+	// Close 之后才能保证文件内容全部刷出。
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close 失败: %v", err)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("读取审计日志失败: %v", err)
+	}
+	content := string(data)
+
+	// 注册记录 + 调用记录都必须在文件里，且每行都是合法 JSON。
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("审计文件应有至少 2 行（注册 + 调用），实际 %d:\n%s", len(lines), content)
+	}
+	var sawCall bool
+	for _, line := range lines {
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("审计行不是合法 JSON: %q, err=%v", line, err)
+		}
+		if ev["plugin"] != "sysinfo" {
+			t.Errorf("审计行的 plugin = %v, 期望 sysinfo", ev["plugin"])
+		}
+		if ev["method"] == "GET" && ev["path"] == "/info" {
+			sawCall = true
+			if ev["outcome"] != "allowed" {
+				t.Errorf("调用记录的 outcome = %v, 期望 allowed", ev["outcome"])
+			}
+		}
+	}
+	if !sawCall {
+		t.Errorf("审计文件里应当有 GET /info 的记录:\n%s", content)
+	}
+}
+
 // ---------- 辅助 ----------
 
 // processExists 判断进程是否仍然存在。

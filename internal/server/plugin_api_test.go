@@ -31,13 +31,21 @@ func newPluginTestServer(t *testing.T) *Server {
 	}
 	// 注册一个外部模式插件：不会真的拉起进程，
 	// 但可以把它置为 running 以验证转发路径的可用性。
+	//
+	// Permissions 必须显式声明（阶段三 3.3 起）：权限校验发生在
+	// 「运行状态检查」之前，未声明的插件会先撞上 403，
+	// 那就测不到本文件真正关心的 503 / 转发语义了。
 	ext := plugin.Descriptor{
 		ID:      "extplug",
 		Name:    "外部插件",
 		Version: "1.0.0",
 		Mode:    plugin.ModeExternal,
+		// 覆盖测试会用到的路径：/info 验证转发链路，
+		// /files 留作权限用例的对照（见 TestPluginPermissionDenied）。
+		Permissions: []string{"system.read", "file.read"},
 		Frontend: plugin.Frontend{
-			Entry:    "extplug",
+			Entry:    "/plugin-assets/extplug/plugin.js",
+			Assets:   "/plugin-assets/extplug/",
 			NavTitle: "外部插件",
 		},
 	}
@@ -439,5 +447,301 @@ func TestPluginFrontendAssetsPrefixContract(t *testing.T) {
 		if fe.Assets != wantPrefix+id+"/" {
 			t.Errorf("插件 %s 的 Assets = %q, 期望 %q", id, fe.Assets, wantPrefix+id+"/")
 		}
+	}
+}
+
+// ============================================================================
+// 阶段三 3.3：权限与审计的接口层验证
+// ============================================================================
+
+// TestPluginPermissionDeniedReturns403 验证越权转发返回结构化 403。
+//
+// 与 internal/plugin 的 proxy 测试的区别：这里验证的是**完整路由链路**——
+// 经过 RequireAuth、ServeMux 匹配、子路径裁剪之后，403 依然能被正确产出，
+// 且不会被 "/api/plugins/{id}/" 通配路由或前端 HTML 兜底吃掉。
+func TestPluginPermissionDeniedReturns403(t *testing.T) {
+	s := newPluginTestServer(t)
+	cookie := loginCookie(t, s)
+
+	// DELETE /files 需要 file.write，extplug 只声明了 file.read。
+	rec := doJSON(t, s, http.MethodDelete, "/api/plugins/extplug/files/a.txt", nil, cookie)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("状态码 = %d, 期望 403, body=%s", rec.Code, rec.Body.String())
+	}
+	assertJSONContentType(t, rec)
+
+	var payload struct {
+		Code     string   `json:"code"`
+		Plugin   string   `json:"plugin"`
+		Required string   `json:"required"`
+		Granted  []string `json:"granted"`
+		Hint     string   `json:"hint"`
+		Scope    string   `json:"scope"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("403 响应解析失败: %v", err)
+	}
+	if payload.Code != "plugin_permission_denied" {
+		t.Errorf("code = %q, 期望 plugin_permission_denied", payload.Code)
+	}
+	if payload.Required != "file.write" {
+		t.Errorf("required = %q, 期望 file.write", payload.Required)
+	}
+	if payload.Hint == "" {
+		t.Error("403 必须带 hint")
+	}
+	if !strings.Contains(payload.Scope, "不是内核级沙箱") {
+		t.Errorf("scope 应说明能力边界，实际 %q", payload.Scope)
+	}
+
+	// 而已声明的 GET /files（file.read）不该被权限拒绝。
+	rec = doJSON(t, s, http.MethodGet, "/api/plugins/extplug/files", nil, cookie)
+	if rec.Code == http.StatusForbidden {
+		t.Errorf("GET /files 已声明 file.read，不该 403: %s", rec.Body.String())
+	}
+}
+
+// TestPluginPermissionDeniedRequiresAuth 验证权限接口不绕过鉴权。
+//
+// 顺序必须是「先鉴权、再鉴权权限」：未登录时应当 401 而不是 403，
+// 否则一个未登录的访客就能靠 403/401 的差异探测出哪些插件存在。
+func TestPluginPermissionDeniedRequiresAuth(t *testing.T) {
+	s := newPluginTestServer(t)
+
+	// 直接构造不带 Cookie 的请求：doJSON 助手要求 cookie 非 nil
+	// （它无条件 AddCookie），因此这里不能复用它。
+	paths := []string{
+		"/api/plugins/extplug/info",
+		"/api/plugins/extplug/permissions",
+		"/api/plugins/extplug/audit",
+		"/api/plugins/audit",
+	}
+	for _, path := range paths {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("未登录取 %s 状态码 = %d, 期望 401, body=%s",
+				path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// TestPluginPermissionsEndpoint 验证权限清单查询接口。
+func TestPluginPermissionsEndpoint(t *testing.T) {
+	s := newPluginTestServer(t)
+	cookie := loginCookie(t, s)
+
+	rec := doJSON(t, s, http.MethodGet, "/api/plugins/extplug/permissions", nil, cookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200, body=%s", rec.Code, rec.Body.String())
+	}
+	assertJSONContentType(t, rec)
+
+	var payload struct {
+		Plugin      string   `json:"plugin"`
+		Permissions []string `json:"permissions"`
+		ScopeNote   string   `json:"scope_note"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("响应解析失败: %v", err)
+	}
+	if payload.Plugin != "extplug" {
+		t.Errorf("plugin = %q, 期望 extplug", payload.Plugin)
+	}
+	if len(payload.Permissions) != 2 {
+		t.Errorf("permissions = %v, 期望 2 条", payload.Permissions)
+	}
+	// scope_note 是要给用户看的说明，必须存在且写明边界。
+	if !strings.Contains(payload.ScopeNote, "不是内核级沙箱") {
+		t.Errorf("scope_note 应说明能力边界，实际 %q", payload.ScopeNote)
+	}
+
+	// 不存在的插件必须 404，而不是返回空权限列表
+	// （否则用户会以为「这个插件什么都没声明」）。
+	rec = doJSON(t, s, http.MethodGet, "/api/plugins/ghost/permissions", nil, cookie)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("不存在的插件状态码 = %d, 期望 404", rec.Code)
+	}
+}
+
+// TestPluginAuditEndpoint 验证审计查询接口。
+func TestPluginAuditEndpoint(t *testing.T) {
+	s := newPluginTestServer(t)
+	cookie := loginCookie(t, s)
+
+	// 先制造一条拒绝记录。
+	rec := doJSON(t, s, http.MethodDelete, "/api/plugins/extplug/files/a.txt", nil, cookie)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("准备拒绝记录失败，状态码 = %d", rec.Code)
+	}
+
+	// --- 全局审计 ---
+	rec = doJSON(t, s, http.MethodGet, "/api/plugins/audit", nil, cookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("全局审计状态码 = %d, 期望 200, body=%s", rec.Code, rec.Body.String())
+	}
+	assertJSONContentType(t, rec)
+
+	var payload struct {
+		Events []struct {
+			Plugin   string `json:"plugin"`
+			Method   string `json:"method"`
+			Path     string `json:"path"`
+			Required string `json:"required"`
+			Outcome  string `json:"outcome"`
+			Status   int    `json:"status"`
+			Time     string `json:"time"`
+		} `json:"events"`
+		Stats struct {
+			Total    uint64 `json:"total"`
+			Retained int    `json:"retained"`
+			Denied   int    `json:"denied"`
+		} `json:"stats"`
+		ByPlugin map[string]struct {
+			Total  uint64 `json:"total"`
+			Denied int    `json:"denied"`
+		} `json:"by_plugin"`
+		Filter struct {
+			Limit int `json:"limit"`
+		} `json:"filter"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("审计响应解析失败: %v\n%s", err, rec.Body.String())
+	}
+	if len(payload.Events) == 0 {
+		t.Fatal("审计事件不应为空")
+	}
+	if payload.Stats.Total == 0 {
+		t.Error("审计统计 total 应大于 0")
+	}
+	if payload.Stats.Denied == 0 {
+		t.Error("审计统计 denied 应大于 0（刚制造了一条拒绝）")
+	}
+	if payload.Filter.Limit <= 0 {
+		t.Error("响应应回显生效的 limit")
+	}
+
+	// 最新在前：第一条应当是刚刚那条 DELETE。
+	first := payload.Events[0]
+	if first.Method != http.MethodDelete || first.Outcome != "denied" {
+		t.Errorf("最新记录 = %+v, 期望 DELETE/denied", first)
+	}
+	if first.Time == "" {
+		t.Error("审计记录必须带时间")
+	}
+
+	// 分插件统计必须包含 extplug。
+	if _, ok := payload.ByPlugin["extplug"]; !ok {
+		t.Errorf("by_plugin 应包含 extplug，实际 %v", payload.ByPlugin)
+	}
+
+	// --- 单插件审计 ---
+	rec = doJSON(t, s, http.MethodGet, "/api/plugins/extplug/audit", nil, cookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("单插件审计状态码 = %d, 期望 200", rec.Code)
+	}
+	var single struct {
+		Events []struct {
+			Plugin string `json:"plugin"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &single); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	for _, ev := range single.Events {
+		if ev.Plugin != "extplug" {
+			t.Errorf("单插件审计返回了其它插件的记录: %q", ev.Plugin)
+		}
+	}
+
+	// --- 过滤 ---
+	rec = doJSON(t, s, http.MethodGet, "/api/plugins/audit?outcome=denied&limit=1", nil, cookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("带过滤的审计查询状态码 = %d", rec.Code)
+	}
+	var filtered struct {
+		Events []struct {
+			Outcome string `json:"outcome"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &filtered); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if len(filtered.Events) != 1 {
+		t.Errorf("limit=1 应返回 1 条，实际 %d", len(filtered.Events))
+	}
+	for _, ev := range filtered.Events {
+		if ev.Outcome != "denied" {
+			t.Errorf("outcome 过滤失效，返回了 %q", ev.Outcome)
+		}
+	}
+
+	// 非法 limit 不该让接口失败（审计页是排查工具，不该因为参数写错就打不开）。
+	rec = doJSON(t, s, http.MethodGet, "/api/plugins/audit?limit=abc", nil, cookie)
+	if rec.Code != http.StatusOK {
+		t.Errorf("非法 limit 应回落到默认值并返回 200，实际 %d", rec.Code)
+	}
+}
+
+// TestPluginAuditRequiresAuth 验证审计接口需要登录。
+//
+// 审计记录包含路径、插件 ID 与来源 IP，属于敏感信息，
+// 绝不能因为「只是日志」就免鉴权。
+func TestPluginAuditRequiresAuth(t *testing.T) {
+	s := newPluginTestServer(t)
+
+	for _, path := range []string{"/api/plugins/audit", "/api/plugins/extplug/audit", "/api/plugins/extplug/permissions"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("未登录取 %s 状态码 = %d, 期望 401", path, rec.Code)
+		}
+	}
+}
+
+// TestPluginListIncludesAuditStats 验证插件列表携带审计统计。
+func TestPluginListIncludesAuditStats(t *testing.T) {
+	s := newPluginTestServer(t)
+	cookie := loginCookie(t, s)
+
+	rec := doJSON(t, s, http.MethodGet, "/api/plugins", nil, cookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", rec.Code)
+	}
+
+	var payload struct {
+		Plugins []plugin.Status `json:"plugins"`
+		Audit   struct {
+			Total    uint64 `json:"total"`
+			Capacity int    `json:"capacity"`
+		} `json:"audit"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if payload.Audit.Capacity <= 0 {
+		t.Errorf("插件列表应带上审计容量信息，实际 %+v", payload.Audit)
+	}
+	// 注册本身就会留下审计记录，因此 total 必然 > 0。
+	if payload.Audit.Total == 0 {
+		t.Error("注册插件应当留下审计记录，total 应大于 0")
+	}
+
+	// 列表里的插件必须带上权限清单，供前端展示。
+	var found bool
+	for _, p := range payload.Plugins {
+		if p.ID == "extplug" {
+			found = true
+			if len(p.Permissions) != 2 {
+				t.Errorf("extplug 的 permissions = %v, 期望 2 条", p.Permissions)
+			}
+		}
+	}
+	if !found {
+		t.Error("插件列表中未找到 extplug")
 	}
 }

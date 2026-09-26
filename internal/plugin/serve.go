@@ -60,7 +60,7 @@ const assetMaxBytes = 8 << 20 // 8 MiB
 
 // Serve 以插件身份运行：监听环境变量指定的 Unix socket 并提供 HTTP 服务。
 //
-// 这个函数由主程序的插件子命令入口调用（见 cmd/lipanel/plugin_main.go），
+// 这个函数由主程序的插件子命令入口调用（见根目录 plugin_main.go），
 // 是整个插件骨架在插件一侧的唯一入口。它阻塞直到收到 SIGTERM/SIGINT。
 //
 // 返回的 error 会由 main 以非 0 退出码结束进程，核心侧据此判定插件启动失败。

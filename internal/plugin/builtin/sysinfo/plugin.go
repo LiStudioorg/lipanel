@@ -69,7 +69,7 @@ var frontendFS embed.FS
 // init 把本插件登记到内置插件注册表。
 //
 // 主程序只用一行匿名 import 引用本包，本包自己完成登记——
-// 新增插件时不需要改动 cmd/lipanel 的任何逻辑。
+// 新增插件时不需要改动主程序入口（根目录 main.go）的任何逻辑。
 func init() {
 	plugin.RegisterBuiltin(ID, func(logger *slog.Logger) plugin.Handler {
 		return New(logger)

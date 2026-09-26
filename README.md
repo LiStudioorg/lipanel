@@ -15,32 +15,39 @@
 ## 目录结构
 
 ```
-cmd/lipanel/      程序入口（main）、启动参数校验、优雅关闭、插件子命令入口
+main.go           程序入口（main）+ go:embed 前端资源（必须在根目录）、
+                  启动参数校验、优雅关闭、插件子命令入口
+plugin_main.go    内置插件的匿名导入清单
 internal/server/  HTTP 服务、路由、中间件、静态资源处理、插件路由与转发
 internal/auth/    密码哈希（bcrypt）、JWT 签发校验、鉴权中间件
 internal/sysinfo/ 系统信息采集（/proc、statfs、/etc/os-release）
 internal/plugin/  插件系统：类型定义、进程管理、Unix socket 反向代理、内置注册表
   builtin/        内置插件实现（当前：sysinfo）
 web/              Vue3 + Vite 前端工程
-webui.go          模块根包，承载 go:embed（见下方说明）
 build.sh          一条命令完成「前端构建 → embed → 静态编译」
 dist/             单二进制输出目录（git 忽略）
 ```
 
-### ⚠️ 为什么 `go:embed` 放在模块根目录的 `webui.go`
+### ⚠️ 为什么入口 `main.go` 必须在模块根目录
 
 `go:embed` 的路径是**相对声明该指令的包所在目录**解析的，且**不允许用 `../` 跨出包目录**。
 
-因此 embed 指令不能写在 `internal/server/`（它会去找 `internal/server/web/dist`，不存在）。
-必须放在模块根目录这一层的包里，再由 `internal/server` 通过 `import "lipanel"` 使用。
+要 embed 的前端产物在 `web/dist`，所以承载 `go:embed` 的包只能待在仓库根目录。
+而 Go 规定**一个目录只能有一个包**——根目录既然已经是一个包，入口就直接放在这里，
+不必再加一层 `cmd/lipanel/`。
 
-> 若后续把 `web/dist` 改到别处，请同步检查 `webui.go` 的相对路径。
+> 历史上根目录曾是 `package lipanel`（由 `webui.go` 承载 embed），入口在 `cmd/lipanel`；
+> 两者无法共存在同一目录，现已合并进 `main.go`（`package main`）。
+> `internal/server` 改为通过 `server.Options.WebFS` 接收注入的文件系统，
+> 不再 `import` 根包（`main` 包本来也不可被 import）。
+
+> 若后续把 `web/dist` 改到别处，请同步检查 `main.go` 里 `//go:embed` 的相对路径。
 
 ## 开发
 
 ```bash
 # 方式一：后端单独跑（前端未构建时，访问 / 会返回 503 并提示构建）
-go run ./cmd/lipanel -addr 127.0.0.1:8080
+go run . -addr 127.0.0.1:8080
 
 # 方式二：前后端联调（Vite dev server 自动把 /api 代理到 8080）
 cd web && npm install && npm run dev
@@ -183,7 +190,7 @@ curl -b cookie.txt http://127.0.0.1:8080/api/plugins/sysinfo/info
 
 1. 新建 `internal/plugin/builtin/<id>/plugin.go`，实现 `plugin.Handler`
    （`Descriptor()` + `Routes(mux)`），并在 `init` 中调用 `plugin.RegisterBuiltin`。
-2. 在 `cmd/lipanel/plugin_main.go` 的 import 块加一行匿名导入。
+2. 在根目录 `plugin_main.go` 的 import 块加一行匿名导入。
 3. 如需前端界面，在 `web/src/plugins/registry.js` 里按 `frontend.entry` 登记组件。
 
 > 前两步在**插件进程**侧生效（后端能力），第三步在**核心**侧生效（界面挂载）。

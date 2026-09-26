@@ -65,7 +65,7 @@ CGO_ENABLED=0 go build \
   -trimpath \
   -ldflags "-s -w -X main.version=${VERSION}" \
   -o "${OUT_BIN}" \
-  ./cmd/lipanel || die "后端编译失败"
+  . || die "后端编译失败"
 
 # ---------- 4. 校验产物 ----------
 log "构建完成: ${OUT_BIN} ($(du -h "${OUT_BIN}" | cut -f1))"

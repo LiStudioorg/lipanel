@@ -2,13 +2,24 @@
 //
 // 单二进制设计：前端构建产物通过 go:embed 打包进本二进制，
 // 运行时不依赖任何外部文件（CGO_ENABLED=0 静态编译）。
+//
+// 为什么入口在仓库根目录（而不是 cmd/lipanel）：
+// go:embed 的路径相对「声明该指令的包所在目录」解析，且不能用 ../ 向上
+// 跨目录。前端产物位于 web/dist，所以承载 embed 的包必须在根目录。
+// 既然根目录已经必须是一个包，入口就直接放在这里，避免为此多一层 cmd/。
+//
+// 历史说明：此前根目录是 package lipanel（webui.go 承载 embed），入口在
+// cmd/lipanel。Go 规定一个目录只能有一个包，两者无法共存，因此现已合并
+// 为本文件（package main）。
 package main
 
 import (
 	"context"
+	"embed"
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -21,6 +32,32 @@ import (
 	"lipanel/internal/plugin"
 	"lipanel/internal/server"
 )
+
+// distFS 承载 web/dist 下的全部前端产物。
+// all: 前缀让以 _ 或 . 开头的文件（如 Vite 可能产出的 .vite 目录）也被打包。
+//
+// 注意：本文件位于模块根目录，因此这里的路径与 web/dist 同级。
+//
+//go:embed all:web/dist
+var distFS embed.FS
+
+// webFS 返回以 web/dist 为根的文件系统，可直接交给 http.FS 使用。
+// 例如 fsys.Open("index.html") 对应 web/dist/index.html。
+func webFS() (fs.FS, error) {
+	return fs.Sub(distFS, "web/dist")
+}
+
+// webBuilt 判断前端产物是否已真实构建。
+// 以 index.html 是否存在为准：仅有占位文件 web/dist/.gitkeep 时返回 false，
+// 以便启动阶段给出「请先构建前端」的明确提示，而不是返回空白页面。
+func webBuilt() bool {
+	f, err := distFS.Open("web/dist/index.html")
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
+}
 
 // version 可在构建时通过 -ldflags "-X main.version=..." 注入。
 var version = "dev"
@@ -136,11 +173,27 @@ func run() error {
 		"socket_dir", pluginManager.SocketDir(),
 	)
 
+	// 注入内嵌前端资源（go:embed 在根目录，见本文件顶部 distFS）。
+	// 仅在没有用 -static-dir 覆盖时才需要解析；解析失败属构建错误，直接终止。
+	var (
+		embeddedFS    fs.FS
+		embeddedBuilt bool
+	)
+	if *staticDir == "" {
+		embeddedFS, err = webFS()
+		if err != nil {
+			return fmt.Errorf("解析内嵌前端资源失败: %w", err)
+		}
+		embeddedBuilt = webBuilt()
+	}
+
 	srv, err := server.New(server.Options{
 		Addr:      bootstrap.Config.Addr,
 		Logger:    logger,
 		Version:   version,
 		StaticDir: *staticDir,
+		WebFS:     embeddedFS,
+		WebBuilt:  embeddedBuilt,
 		Auth:      authenticator,
 		Plugins:   pluginManager,
 	})

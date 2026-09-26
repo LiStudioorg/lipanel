@@ -7,7 +7,7 @@
 // 这些用例会真的拉起子进程，因此必须用「主程序自身」作为可执行文件。
 // go test 会把测试二进制编译到临时目录，进程被拉起后
 // os.Args[1] 会是 "__plugin_sysinfo"，此时子进程会走 main 的插件分支吗？
-// 不会——这是测试二进制，不是 cmd/lipanel。
+// 不会——这是测试二进制，不是真正的 lipanel 入口。
 // 因此这些用例先编译出真正的 lipanel 二进制再跑（见 buildTestBinary），
 // 否则「用测试二进制当插件宿主」会直接失败。
 package plugin_test
@@ -50,7 +50,7 @@ func buildTestBinary(t *testing.T) string {
 		out := filepath.Join(dir, "lipanel-test")
 
 		// 从本测试文件所在目录回溯到模块根（internal/plugin → ../..）。
-		cmd := exec.Command("go", "build", "-o", out, "./cmd/lipanel")
+		cmd := exec.Command("go", "build", "-o", out, ".")
 		cmd.Dir = moduleRoot()
 		// 沙箱内 HOME 不可写，必须显式指定缓存目录（见开发计划坑位 6）。
 		cmd.Env = append(os.Environ(),

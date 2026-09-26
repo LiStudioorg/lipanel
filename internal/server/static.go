@@ -1,19 +1,18 @@
 package server
 
 import (
+	"errors"
 	"io/fs"
 	"net/http"
 	"os"
 	"strings"
-
-	"lipanel"
 )
 
 // staticHandler 返回处理前端页面的 handler。
 //
 // 优先级：
 //  1. Options.StaticDir 非空 → 使用磁盘目录（开发调试用，改完刷新即可生效）。
-//  2. 否则 → 使用 go:embed 打包进二进制的 web/dist（单二进制运行方式）。
+//  2. 否则 → 使用 Options.WebFS 注入的内嵌资源（单二进制运行方式）。
 //
 // SPA 兜底：未命中静态文件且不是 /api 前缀的路径，一律返回 index.html，
 // 交给前端路由处理。
@@ -30,12 +29,19 @@ func (s *Server) staticHandler() (http.Handler, error) {
 		return s.spaHandler(os.DirFS(s.opts.StaticDir)), nil
 	}
 
-	fsys, err := lipanel.WebFS()
-	if err != nil {
-		return nil, err
+	// WebFS 由 main 注入（见 main.go 的 go:embed）。
+	//
+	// 为什么不在这里直接 import 根包：入口 main.go 迁到根目录后，根目录是
+	// package main，而 Go 不允许 import 一个 main 包。由调用方注入 fs.FS
+	// 反而更干净——internal/server 不再依赖"前端产物放在哪"这种部署细节，
+	// 测试里也能塞一个内存 FS。
+	if s.opts.WebFS == nil {
+		return nil, errors.New(
+			"server: 未注入前端资源（Options.WebFS 为空）；" +
+				"请用 -static-dir 指定目录，或由 main 注入 go:embed 的文件系统")
 	}
-	s.logger.Info("使用内置 embed 静态资源", "built", lipanel.WebBuilt())
-	return s.spaHandler(fsys), nil
+	s.logger.Info("使用内置 embed 静态资源", "built", s.opts.WebBuilt)
+	return s.spaHandler(s.opts.WebFS), nil
 }
 
 // spaHandler 基于 fs.FS 提供静态文件服务，并实现 SPA 兜底与 API 404 语义。

@@ -46,6 +46,10 @@ func newAuthedTestServer(t *testing.T) *Server {
 		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Version: "test",
 		Auth:    authenticator,
+		// 前端资源由 main 注入（根包已是 package main，无法被 import），
+		// 测试里用内存 FS 顶替，见 server_test.go 的 testFS。
+		WebFS:    testFS(),
+		WebBuilt: true,
 	})
 	if err != nil {
 		t.Fatalf("构造 Server 失败: %v", err)

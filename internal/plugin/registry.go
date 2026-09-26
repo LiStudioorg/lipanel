@@ -10,7 +10,7 @@ import (
 // Factory 是内置插件的构造函数。
 //
 // 内置插件在包初始化时通过 RegisterBuiltin 登记自己，
-// cmd/lipanel 再用 Build 统一构造——这样主程序的插件入口
+// 根目录 main.go 再用 Build 统一构造——这样主程序的插件入口
 // 不需要 import 每个具体插件包，新增插件只改插件的 init。
 type Factory func(logger *slog.Logger) Handler
 

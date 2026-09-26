@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -27,8 +28,17 @@ type Options struct {
 	Logger *slog.Logger
 	// Version 是构建版本号，会出现在 /api/health 响应中。
 	Version string
-	// StaticDir 是前端静态资源目录；为空表示使用内置 embed 资源（见 static.go）。
+	// StaticDir 是前端静态资源目录；为空表示使用 WebFS 注入的内嵌资源。
 	StaticDir string
+	// WebFS 是内嵌的前端产物文件系统（以 dist 为根，含 index.html）。
+	//
+	// 由 main 通过 go:embed 注入：入口迁移到仓库根目录后根包是 package main，
+	// 而 Go 不允许 import main 包，因此不能再由本包直接引用根包。
+	// 注入方式也让本包与「前端产物存放位置」彻底解耦。
+	WebFS fs.FS
+	// WebBuilt 表示前端产物是否已真实构建（仅有 .gitkeep 时为 false），
+	// 仅用于启动日志提示，避免用户对着空白页面猜测原因。
+	WebBuilt bool
 	// Auth 提供登录鉴权能力；为 nil 时使用 New 内部的默认实现（见 buildAuth）。
 	Auth *auth.Authenticator
 	// Plugins 提供插件管理能力；为 nil 时插件相关接口返回 503。
@@ -64,7 +74,7 @@ func New(opts Options) (*Server, error) {
 	s := &Server{opts: opts, logger: logger}
 
 	// 注入鉴权组件：未显式传入时构造一个仅用于本地开发的默认实例。
-	// 生产环境必须由 main 传入（见 cmd/lipanel 的启动参数校验）。
+	// 生产环境必须由 main 传入（见根目录 main.go 的启动参数校验）。
 	if opts.Auth != nil {
 		s.auth = opts.Auth
 	} else {

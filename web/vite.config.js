@@ -64,6 +64,38 @@ export default defineConfig({
         })
       },
     },
+
+    // 构建态：把入口 chunk runtime.js 改名为 vue.js。
+    //
+    // 为什么必须改名：index.html 的 importmap 把裸说明符 "vue" 固定指向
+    // /assets/vue.js（稳定路径，不能带内容哈希）。而 rollupOptions 里的入口
+    // 名是 runtime（源文件 src/runtime.js），Vite 会产出 assets/runtime.js。
+    // 若不做这一步，importmap 指向的 /assets/vue.js **根本不存在**，
+    // 请求会落到 SPA 兜底返回 index.html，浏览器按 MIME 拒绝执行，
+    // 表现为「主应用正常、插件前端加载失败」。
+    //
+    // 实现方式：在 generateBundle 阶段直接改 chunk 的文件名。
+    // 这里必须用闭包里的 this 而非箭头函数——Rollup 通过 this 暴露插件上下文。
+    {
+      name: 'lipanel-runtime-entry',
+      apply: 'build',
+      generateBundle(_options, bundle) {
+        const chunk = bundle['assets/runtime.js']
+        if (!chunk) return
+        chunk.fileName = 'assets/vue.js'
+        // 同步修正引用该 chunk 的其它 bundle（index.html / 动态 import）。
+        for (const item of Object.values(bundle)) {
+          if (item.type === 'chunk' && item.imports) {
+            item.imports = item.imports.map((i) => (i === 'assets/runtime.js' ? 'assets/vue.js' : i))
+          }
+          if (item.type === 'chunk' && item.dynamicImports) {
+            item.dynamicImports = item.dynamicImports.map((i) =>
+              i === 'assets/runtime.js' ? 'assets/vue.js' : i,
+            )
+          }
+        }
+      },
+    },
   ],
   resolve: {
     alias: {

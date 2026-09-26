@@ -16,7 +16,7 @@ import (
 // PluginSubcommandPrefix 是内置插件子命令的前缀。
 //
 // 主程序启动时检查 os.Args[1]：若形如 "__plugin_sysinfo"，
-// 则不启动 HTTP 面板，而是以插件身份运行（见 cmd/lipanel）。
+// 则不启动 HTTP 面板，而是以插件身份运行（见根目录 main.go）。
 // 之所以用双下划线前缀，是为了和正常 CLI 参数（-addr 等）绝对不会冲突。
 const PluginSubcommandPrefix = "__plugin_"
 

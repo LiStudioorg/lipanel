@@ -116,7 +116,7 @@ jobs:
             -trimpath \
             -ldflags "-s -w -X main.version=${VERSION}" \
             -o "dist/${OUT_NAME}" \
-            ./cmd/lipanel
+            .
           
           # 打包 tar.gz
           tar -czvf "dist/lipanel_${VERSION}_${GOOS}_${GOARCH}.tar.gz" -C dist "${OUT_NAME}"

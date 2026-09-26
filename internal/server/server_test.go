@@ -3,23 +3,40 @@ package server
 import (
 	"encoding/json"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-
-	"lipanel"
+	"testing/fstest"
 )
 
+// testFS 是大多数测试共用的最小前端资源：存在 index.html 表示"已构建"。
+func testFS() fstest.MapFS {
+	return fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte("<!doctype html><title>lipanel</title>")},
+	}
+}
+
 // newTestServer 构造一个用于测试的 Server，日志丢弃以免污染测试输出。
+// 注入一个最小前端资源，使构造必定成功（不注入会被视为配置错误）。
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
+	return newTestServerWithFS(t, testFS())
+}
+
+// newTestServerWithFS 用指定前端资源构造 Server。
+func newTestServerWithFS(t *testing.T, fsys fs.FS) *Server {
+	t.Helper()
 	s, err := New(Options{
-		Addr:    "127.0.0.1:0",
-		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Version: "test",
+		Addr:     "127.0.0.1:0",
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Version:  "test",
+		WebFS:    fsys,
+		WebBuilt: fsys != nil,
 	})
 	if err != nil {
 		t.Fatalf("构造 Server 失败: %v", err)
@@ -69,13 +86,17 @@ func TestUnknownAPIReturnsJSON404(t *testing.T) {
 	}
 }
 
-// 前端未构建时访问页面应返回 503，并给出可操作的错误提示。
-// 若已执行过前端构建（embed 中有 index.html），该分支不适用，跳过。
+// 前端未注入时访问页面应返回 503，并给出可操作的错误提示。
+//
+// 注意：前端资源现在由 main 通过 Options.WebFS 注入（入口迁到根目录后，
+// 根包是 package main，internal/server 不能再 import 它）。
+// 因此这里用 fstest.MapFS 构造内存文件系统，测试不再依赖"构建产物是否存在"，
+// 也就不会因为跑过一次 npm run build 而变成 skip。
 func TestRootWithoutFrontendReturns503(t *testing.T) {
-	if lipanel.WebBuilt() {
-		t.Skip("检测到已构建的前端产物，跳过「未构建」分支")
-	}
-	s := newTestServer(t)
+	// 模拟「只有 .gitkeep 占位、没有 index.html」的未构建状态。
+	s := newTestServerWithFS(t, fstest.MapFS{
+		".gitkeep": &fstest.MapFile{Data: []byte("# 占位文件\n")},
+	})
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
@@ -83,6 +104,51 @@ func TestRootWithoutFrontendReturns503(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("状态码 = %d, 期望 %d（前端未构建）", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// 注入的内嵌资源可用时，未知路由应回退到 index.html（SPA 兜底）。
+func TestEmbeddedFSServesIndexForUnknownRoute(t *testing.T) {
+	const indexHTML = "<!doctype html><title>lipanel-test</title>"
+	s := newTestServerWithFS(t, fstest.MapFS{
+		"index.html":           &fstest.MapFile{Data: []byte(indexHTML)},
+		"assets/app-abc123.js": &fstest.MapFile{Data: []byte("console.log(1)")},
+	})
+
+	// SPA 兜底：未命中的前端路由返回 index.html。
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/plugins/sysinfo", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("未知前端路由状态码 = %d, 期望 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "lipanel-test") {
+		t.Errorf("响应体不是注入的 index.html: %s", rec.Body.String())
+	}
+
+	// 命中真实文件时直接返回该文件。
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/assets/app-abc123.js", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("静态资源状态码 = %d, 期望 200", rec.Code)
+	}
+	if rec.Body.String() != "console.log(1)" {
+		t.Errorf("静态资源内容 = %q", rec.Body.String())
+	}
+}
+
+// 未注入任何前端资源（既没有 -static-dir 也没有 WebFS）时应明确报错，
+// 而不是静默返回空白页。
+func TestNoFrontendSourceFailsFast(t *testing.T) {
+	_, err := New(Options{
+		Addr:    "127.0.0.1:0",
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Version: "test",
+	})
+	if err == nil {
+		t.Fatal("既无 StaticDir 又无 WebFS 时应当返回错误")
+	}
+	if !strings.Contains(err.Error(), "WebFS") {
+		t.Errorf("错误信息应指出缺少 WebFS，实际: %v", err)
 	}
 }
 

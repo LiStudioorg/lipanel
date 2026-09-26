@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test src/plugins/bridge.test.mjs"
+    "test": "node --test src/plugins/bridge.test.mjs src/views/services.logic.test.mjs"
   },
   "dependencies": {
     "naive-ui": "^2.40.1",

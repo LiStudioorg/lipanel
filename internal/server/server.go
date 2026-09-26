@@ -108,9 +108,10 @@ func New(opts Options) (*Server, error) {
 	s.serviceMgr = opts.Services
 
 	mux := http.NewServeMux()
+	// 服务路由由 registerAPIRoutes 内部统一注册（核心自带功能，
+	// 与其它 /api 接口登记在同一处）。
 	s.registerAPIRoutes(mux)
 	s.registerPluginRoutes(mux)
-	s.registerServiceRoutes(mux)
 
 	staticHandler, err := s.staticHandler()
 	if err != nil {

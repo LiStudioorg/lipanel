@@ -22,6 +22,15 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// ---------- 需要登录的接口 ----------
 	mux.Handle("GET /api/auth/me", s.auth.RequireAuth(http.HandlerFunc(s.handleAuthMe)))
 	mux.Handle("GET /api/system/info", s.auth.RequireAuth(http.HandlerFunc(s.handleSystemInfo)))
+
+	// ---------- 服务管理（阶段四 4.1，核心自带）----------
+	//
+	// 这里是核心功能的统一登记处，因此服务路由的**注册入口**放在本函数；
+	// 具体 handler 与实现细节在 service_api.go / internal/service 包。
+	// 之所以不在本文件里逐个写 mux.Handle：服务有多条路由且要处理
+	// "审计路径必须先于 {name} 通配注册"的顺序问题，
+	// 集中在一个注册函数里比散落在两处更不容易写错。
+	s.registerServiceRoutes(mux)
 }
 
 // healthResponse 是 /api/health 的响应体，字段使用 snake_case 以便前端直接消费。

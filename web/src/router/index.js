@@ -30,6 +30,16 @@ const routes = [
     meta: { title: '插件管理' },
   },
   {
+    // 服务管理页（阶段四 4.1）。
+    //
+    // 放在静态路由段（不是 /plugins/:id 那样的通配），因为它是核心内置能力，
+    // 与服务无关的插件机制不应影响它的可达性。
+    path: '/services',
+    name: 'service-list',
+    component: () => import('@/views/ServicesView.vue'),
+    meta: { title: '服务管理' },
+  },
+  {
     // 插件操作审计页（阶段三 3.3）。
     // 必须放在 "/plugins/:id" 之前：否则 "audit" 会被当成插件 ID
     // 命中了通配路由，打开审计页会变成"插件 audit 不存在"。

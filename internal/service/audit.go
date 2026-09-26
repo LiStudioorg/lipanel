@@ -47,6 +47,13 @@ const (
 	AuditFailed = "failed"
 )
 
+// SourceCore 是核心自带能力发起的事件来源标记。
+//
+// 服务管理直接跑在核心进程里，不经过插件转发通道，
+// 因此来源如实记为 core —— 刻意**不**伪造一个插件 ID 来复用插件审计，
+// 那会让插件审计页冒出一个根本不存在的"插件"。
+const SourceCore = "core"
+
 // AuditEvent 是一条服务操作审计记录。
 //
 // 字段刻意保持扁平：它会以 JSONL 形式落盘，也可能被外部日志采集器消费。
@@ -58,6 +65,14 @@ type AuditEvent struct {
 	// Kind 标记事件类别，用于在同一份 JSONL 里区分来源。
 	// 服务事件固定为 "service"，插件事件为 "plugin"（由插件审计写入）。
 	Kind string `json:"kind"`
+	// Source 标记事件由**谁**产生。服务管理是核心自带能力
+	// （不经过插件转发），因此固定为 SourceCore = "core"。
+	//
+	// 与 Kind 的分工：Kind 说"这是什么类型的事件"，Source 说"谁干的"。
+	// 合成一个字段会让采集器难以按来源过滤
+	// （例如"只看核心发起的操作"）。这也正是本模块**不伪造插件 ID**的
+	// 体现——来源如实标注为 core，不会污染插件审计的统计。
+	Source string `json:"source,omitempty"`
 	// User 是**发起操作的登录用户名**——审计的核心字段，
 	// 直接回答「谁干的」。未登录调用（理论不可达，接口均有鉴权）为空。
 	User string `json:"user,omitempty"`
@@ -182,6 +197,11 @@ func (a *Auditor) Record(ev AuditEvent) {
 	}
 	if ev.Kind == "" {
 		ev.Kind = "service"
+	}
+	// 来源固定标注为 core：本模块是核心自带能力，不经过插件转发。
+	// 调用方一般不必自己设置它。
+	if ev.Source == "" {
+		ev.Source = SourceCore
 	}
 	if ev.Outcome == "" {
 		ev.Outcome = AuditAllowed

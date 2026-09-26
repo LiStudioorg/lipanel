@@ -9,16 +9,25 @@
 const DEFAULT_TIMEOUT_MS = 10000
 
 export class ApiError extends Error {
-  constructor(message, { status = 0, cause } = {}) {
+  constructor(message, { status = 0, cause, hint = '' } = {}) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.cause = cause
+    // hint 是后端给出的「怎么办」提示（例如「请以 root 身份运行 lipanel」）。
+    // 单独一个字段而不是拼进 message：调用方可以决定它作为副标题、
+    // 弹窗正文还是仅记录日志；拼进 message 就再也拆不开了。
+    this.hint = hint || ''
   }
 
   // 401 需要特殊处理：路由守卫与视图据此跳转登录页。
   get isUnauthorized() {
     return this.status === 401
+  }
+
+  // messageWithHint 返回「错误 + 怎么办」的组合文本，便于统一展示。
+  get messageWithHint() {
+    return this.hint ? `${this.message}（${this.hint}）` : this.message
   }
 }
 

@@ -142,7 +142,6 @@ func rebuildTestRoutes(s *Server) {
 	mux := http.NewServeMux()
 	s.registerAPIRoutes(mux)
 	s.registerPluginRoutes(mux)
-	s.registerServiceRoutes(mux)
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		_, _ = w.Write([]byte("<!doctype html>"))
@@ -462,6 +461,30 @@ func TestServiceAuditEndpoint(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
 	if len(resp.Events) != 0 {
 		t.Errorf("按 outcome=denied 过滤返回 %d 条，期望 0 条", len(resp.Events))
+	}
+}
+
+// TestServiceAuditMarksSourceAsCore 断言审计事件的来源被如实标注为 core。
+//
+// 设计要点：服务管理是**核心自带**能力，不经过插件转发通道，
+// 因此来源记为 core，而**不是**伪造一个插件 ID（如 "core:systemd"）。
+// 伪造插件 ID 会让插件审计页冒出一个根本不存在的"插件"、统计失真。
+func TestServiceAuditMarksSourceAsCore(t *testing.T) {
+	ex := &stubExecutor{}
+	srv, mgr := newServiceTestServer(t, ex)
+
+	loginAndDo(t, srv, "POST", "/api/services/nginx.service/start")
+
+	events := mgr.Auditor().Query(service.AuditFilter{})
+	if len(events) != 1 {
+		t.Fatalf("审计记录 %d 条，期望 1 条", len(events))
+	}
+	if events[0].Source != service.SourceCore {
+		t.Errorf("Source = %q，期望 %q（核心自带能力应标记为 core）",
+			events[0].Source, service.SourceCore)
+	}
+	if events[0].Kind != "service" {
+		t.Errorf("Kind = %q，期望 service", events[0].Kind)
 	}
 }
 

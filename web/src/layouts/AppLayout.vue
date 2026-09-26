@@ -34,6 +34,9 @@ const pluginMenuError = ref('')
 // builtinMenus 是核心自带的功能入口。
 const builtinMenus = [
   { key: 'dashboard', label: '系统概览', icon: '📊', to: { name: 'dashboard' } },
+  // 服务管理（阶段四 4.1）：内置页面而非插件——
+  // systemd 服务是面板的基础运维能力，不该依赖插件机制是否可用。
+  { key: 'service-list', label: '服务管理', icon: '⚙️', to: { name: 'service-list' } },
   { key: 'plugins', label: '插件管理', icon: '🧩', to: { name: 'plugin-list' } },
   // 审计页（阶段三 3.3）：权限声明是"拒绝对了没"的唯一可见证据，
   // 因此把它放在一级菜单，而不是藏进插件详情里。

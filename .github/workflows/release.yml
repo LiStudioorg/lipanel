@@ -93,6 +93,6 @@ jobs:
         with:
           # 只抓裸二进制文件（windows 带 .exe，linux 无后缀，全部匹配 lipanel_*）
           files: |
-            dist/lipanel_*
+            dist/**/lipanel_*
           generate_release_notes: true
           draft: false

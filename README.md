@@ -15,10 +15,12 @@
 ## 目录结构
 
 ```
-cmd/lipanel/      程序入口（main）、启动参数校验、优雅关闭
-internal/server/  HTTP 服务、路由、中间件、静态资源处理
+cmd/lipanel/      程序入口（main）、启动参数校验、优雅关闭、插件子命令入口
+internal/server/  HTTP 服务、路由、中间件、静态资源处理、插件路由与转发
 internal/auth/    密码哈希（bcrypt）、JWT 签发校验、鉴权中间件
 internal/sysinfo/ 系统信息采集（/proc、statfs、/etc/os-release）
+internal/plugin/  插件系统：类型定义、进程管理、Unix socket 反向代理、内置注册表
+  builtin/        内置插件实现（当前：sysinfo）
 web/              Vue3 + Vite 前端工程
 webui.go          模块根包，承载 go:embed（见下方说明）
 build.sh          一条命令完成「前端构建 → embed → 静态编译」
@@ -58,6 +60,7 @@ cd web && npm install && npm run dev
 | `-jwt-secret` | 空 | JWT 签名密钥（≥ 16 字节）；留空则读取配置文件或自动生成 |
 | `-token-ttl` | `2h` | 会话有效期，如 `30m`、`12h`（覆盖配置文件） |
 | `-secure-cookie` | `false` | 仅通过 HTTPS 传输会话 Cookie（反代启用 TLS 时开启） |
+| `-plugin-socket-dir` | `<临时目录>/lipanel-plugins` | 插件 Unix socket 存放目录（自动创建并设为 `0700`） |
 | `-gen-secret` | - | 生成一个随机密钥后退出，便于写入配置 |
 | `-gen-password-hash` | - | 把给定明文密码转成 bcrypt 哈希后退出，便于写入配置 |
 | `-version` | - | 打印版本号后退出 |
@@ -143,10 +146,48 @@ cd web && npm install && npm run dev
 | POST | `/api/logout` | 公开 | 清除会话 Cookie（未登录调用也返回 200） |
 | GET | `/api/auth/me` | 需登录 | 返回 `{username, expires_at}`，供前端路由守卫恢复登录态 |
 | GET | `/api/system/info` | 需登录 | 返回 CPU / 内存 / 磁盘 / 系统版本等基础信息 |
+| GET | `/api/plugins` | 需登录 | 插件列表（含实时状态与前端插槽元数据） |
+| GET | `/api/plugins/{id}` | 需登录 | 单个插件状态 |
+| POST | `/api/plugins/{id}/start` | 需登录 | 启动插件（拉起进程并等 socket 就绪） |
+| POST | `/api/plugins/{id}/stop` | 需登录 | 停止插件（SIGTERM → 超时 SIGKILL） |
+| POST | `/api/plugins/{id}/restart` | 需登录 | 重启插件 |
+| POST | `/api/plugins/{id}/health` | 需登录 | 主动健康探测 |
+| ANY | `/api/plugins/{id}/*` | 需登录 | **转发给插件进程处理**（核心只做代理） |
 
 未登录访问受保护接口统一返回 `401 {"error":"未登录或登录已过期，请重新登录"}`；
 未注册的 `/api/*` 统一返回 JSON `404`（不会误返回前端 HTML）；
 未命中的非 `/api` 路径回退到 `index.html`，交给前端路由。
+
+### 插件系统
+
+**通讯协议：Unix domain socket 上的 HTTP/1.1**（不使用 gRPC）。
+
+- **插件形态是「单二进制 + 子命令」**：核心以自身可执行文件重新 exec，
+  参数为 `__plugin_<id>`，该进程即进入插件模式。
+  因此 `dist/lipanel` **一个文件**同时提供面板、前端与全部内置插件。
+- **socket 权限**：文件 `0600`、目录 `0700`。Unix socket 的权限即访问控制，
+  同机其他用户无法绕过面板鉴权直连插件。
+- **两种运行模式**：`managed`（核心 fork/exec 托管，默认）与
+  `external`（核心只拨号，进程由 systemd 或手工启动）。
+- **转发时剥离 `Cookie` 与 `Authorization`**：插件拿不到面板会话凭据，
+  即使插件被攻陷也无法冒充已登录用户。
+
+```bash
+# 列出插件 / 启动 / 调用插件自己的接口
+curl -b cookie.txt http://127.0.0.1:8080/api/plugins
+curl -b cookie.txt -X POST http://127.0.0.1:8080/api/plugins/sysinfo/start
+curl -b cookie.txt http://127.0.0.1:8080/api/plugins/sysinfo/info
+```
+
+**新增插件的步骤**（当前仅支持内置插件）：
+
+1. 新建 `internal/plugin/builtin/<id>/plugin.go`，实现 `plugin.Handler`
+   （`Descriptor()` + `Routes(mux)`），并在 `init` 中调用 `plugin.RegisterBuiltin`。
+2. 在 `cmd/lipanel/plugin_main.go` 的 import 块加一行匿名导入。
+3. 如需前端界面，在 `web/src/plugins/registry.js` 里按 `frontend.entry` 登记组件。
+
+> 前两步在**插件进程**侧生效（后端能力），第三步在**核心**侧生效（界面挂载）。
+> 路由 `/plugins/:id` 与菜单渲染无需改动——这是「插件前端挂载插槽」的设计目的。
 
 ### 鉴权设计
 
@@ -223,5 +264,11 @@ cd web && npm install && npm run dev
 - [x] 2.4 系统信息接口（`/api/system/info`）
 - [x] 2.5 前端系统信息面板（卡片 + 进度条 + Loading/Error 兜底）
 - [x] 2.6 配置与持久化（`-config` + 凭据自动生成落盘）
+
+### 第三阶段：插件系统 🔄
+
+- [x] 3.1 插件系统骨架（Unix socket 通讯 + 进程管理 + 路由转发 + 内置 `sysinfo` 插件 + 前端挂载插槽）
+- [ ] 3.2 插件前端动态挂载
+- [ ] 3.3 插件权限与审计
 
 详细进度与已知坑位见 [`开发计划.md`](./开发计划.md)。

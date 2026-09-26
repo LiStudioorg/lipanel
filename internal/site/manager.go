@@ -444,13 +444,50 @@ func (m *Manager) scanDir(dir string, sites map[string]*Site, enabledDir bool) e
 				"已标记为只读。若这是面板创建的站点，说明配置文件被外部修改过。"
 		}
 		if len(parsed.ServerNames) > 0 {
-			s.Domain = strings.Join(parsed.ServerNames, " ")
+			s.Domain = joinServerNames(parsed.ServerNames)
 		}
 		if !parsed.Generated && s.ParseNote == "" {
 			s.ParseNote = "该配置不是由面板创建，面板不会修改它（只读展示）。"
 		}
 	}
 	return nil
+}
+
+// joinServerNames 把解析出的 server_name 列表拼成一个展示用的域名串。
+//
+// ########## 为什么必须去重（阶段四 4.4 发现的真实缺陷）##########
+//
+// 一个配置文件里**可以合法地包含多个 server 块**，每个块都有自己的
+// server_name。4.4 引入的 HTTP → HTTPS 跳转块正是这种情况：
+//
+//	server { listen 80;  server_name demo.example.com; return 301 ...; }
+//	server { listen 443; server_name demo.example.com; ... }
+//
+// 简单地把所有 server_name 拼接起来，结果就是
+//
+//	"demo.example.com demo.example.com"
+//
+// 这个字符串会被当作域名**回写进站点对象**，后果是连锁的：
+//
+//	① 列表页显示一个奇怪的重复域名；
+//	② 更严重的是证书关联会失效——ssl 模块拿这个域名去匹配证书，
+//	   拼出来的串与任何证书的域名都不相等，于是"明明申请成功了，
+//	   状态却一直显示未申请"（这正是端到端测试抓到的现象）。
+//
+// 去重保留了多域名场景（`server_name a.com b.com;` 仍然有用），
+// 只消除同一域名因多个 server 块而重复出现的情况。
+func joinServerNames(names []string) string {
+	seen := make(map[string]bool, len(names))
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return strings.Join(out, " ")
 }
 
 // Get 返回单个站点。
@@ -657,6 +694,77 @@ func (m *Manager) Update(ctx context.Context, name string, in SiteInput) (Site, 
 
 	m.logger.Info("站点已更新",
 		"name", s.Name, "domain", s.Domain, "type", s.Type, "enabled", s.Enabled)
+	return m.Get(name)
+}
+
+// SetSSL 把 TLS 配置写入站点（阶段四 4.4）。
+//
+// ########## 为什么这个方法必须存在于 site 包，而不是 ssl 包里 ##########
+//
+// 它做的事情与 Update 完全一样：**用模板重新渲染整份配置，
+// 再走「快照 → 写盘 → nginx -t → reload → 失败回滚」链路**。
+// 这段链路是 4.3 花了大量精力做对并测试锁死的能力
+// （快照必须覆盖"配置内容/启用链接/disabled 文件"三样东西，
+// 回滚后必须复验 nginx -t，reload 失败时回滚后还要再 reload 一次）。
+//
+// 让 ssl 包自己写配置文件，等于把这套逻辑复制一份：
+// 复制出来的那份不会有这些测试覆盖，而它一旦写错，
+// 后果是**整台机器的 HTTPS 全部不可用**。
+//
+// 因此 ssl 包只负责"我知道证书在哪"，写配置这件事通过
+// main.go 注入的回调交回给本方法。
+//
+// cfg 为 nil 表示移除 SSL 配置（回到纯 HTTP）。
+func (m *Manager) SetSSL(ctx context.Context, name string, cfg *SSLConfig) (Site, error) {
+	if err := ValidSiteName(name); err != nil {
+		return Site{}, err
+	}
+	if !m.Available() {
+		return Site{}, fmt.Errorf("%w: %s", ErrAdapterUnavailable, m.UnavailableReason())
+	}
+
+	existing, err := m.Get(name)
+	if err != nil {
+		return Site{}, err
+	}
+	// 与编辑站点同样的限制：外部配置（非面板生成）不允许改写。
+	// 证书配置也是配置——把它写进用户手写的文件同样会抹掉他的内容。
+	if !existing.Generated {
+		return Site{}, fmt.Errorf("%w: %s（%s）", ErrExternal, name, existing.ParseNote)
+	}
+
+	// 用现有字段重新渲染整份配置，只把 SSL 部分换掉。
+	// 这里刻意**不重新校验 root/upstream 的存在性**：
+	// 证书申请成功后站点配置本已可用，此时若因为"根目录刚好
+	// 被删了"而拒绝写入证书，会让用户卡在"证书拿到了但用不上"。
+	// renderCheck 里的语法校验仍然会跑（在 Render 内部）。
+	s := Site{
+		Name:     existing.Name,
+		Domain:   existing.Domain,
+		Type:     existing.Type,
+		Root:     existing.Root,
+		Upstream: existing.Upstream,
+		Enabled:  existing.Enabled,
+	}
+
+	renderOpts := m.renderOpts
+	renderOpts.SSL = cfg
+
+	content, err := Render(s, renderOpts)
+	if err != nil {
+		return Site{}, err
+	}
+
+	snap := m.snapshot(name)
+	if err := m.apply(ctx, name, content, s.Enabled, snap); err != nil {
+		return Site{}, err
+	}
+
+	action := "已启用 HTTPS"
+	if cfg == nil {
+		action = "已移除 HTTPS"
+	}
+	m.logger.Info("站点 "+action, "name", s.Name, "domain", s.Domain)
 	return m.Get(name)
 }
 

@@ -48,6 +48,20 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// 已由 registerSiteRoutes 集中处理，详见其注释与
 	// site_api_test.go 中锁死该行为的测试。
 	s.registerSiteRoutes(mux)
+
+	// ---------- SSL 证书（阶段四 4.4，核心自带）----------
+	//
+	// 与 4.1/4.2/4.3 同一套架构：ssl_api.go 承载 handler，
+	// internal/ssl 承载 ACME 客户端探测、证书解析、命令组装、
+	// 权限与审计；而**配置写入**由 4.3 的 site.Manager 经
+	// 「nginx -t + 失败自动回滚」链路完成——
+	// 证书配置写坏同样是全站中断，因此绝不自己写文件。
+	//
+	// ⚠️ 该注册函数内部有**顺序要求**（/api/ssl/audit 与
+	// /api/ssl/capabilities 必须先于 /api/ssl/{name}/... 注册），
+	// 已由 registerSSLRoutes 集中处理，详见其注释与
+	// ssl_api_test.go 中锁死该行为的测试。
+	s.registerSSLRoutes(mux)
 }
 
 // healthResponse 是 /api/health 的响应体，字段使用 snake_case 以便前端直接消费。

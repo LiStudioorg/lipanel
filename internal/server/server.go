@@ -20,6 +20,7 @@ import (
 	"lipanel/internal/plugin"
 	"lipanel/internal/service"
 	"lipanel/internal/site"
+	"lipanel/internal/ssl"
 	"lipanel/internal/sysinfo"
 )
 
@@ -68,21 +69,37 @@ type Options struct {
 	// 它也只会返回「不可用」而不是报错——降级判断在 site 包内
 	// （由 SystemAdapter 探测目录布局得出结论），这里不重复判断。
 	Sites *site.Manager
+	// SSL 提供 Let's Encrypt 证书管理能力（阶段四 4.4，核心自带）。
+	// 为 nil 时 SSL 相关接口返回 JSON 503（与 Plugins/Services/Sites 同样的降级策略）。
+	//
+	// 与其它模块一样，"没装 certbot" 不等于"接口不可用"：
+	// 那种情况下接口返回 200 且 available=false，
+	// 让前端能渲染出带原因的说明页而不是一个红色错误框。
+	SSL *ssl.Manager
+	// SSLScheduler 提供自动续期的运行状态（可选）。
+	//
+	// 单独注入而不是从 SSL Manager 里取：调度器是**可选的**
+	// （用户可以只用 -cert-renew-interval 0 关掉它），
+	// 而状态接口需要在它不存在时也能正常返回。
+	// 为 nil 时状态里 scheduler.running=false。
+	SSLScheduler *ssl.RenewScheduler
 }
 
 // Server 封装 HTTP 服务及其依赖。
 type Server struct {
-	opts        Options
-	logger      *slog.Logger
-	auth        *auth.Authenticator
-	sysinfo     *sysinfo.Collector
-	plugins     *plugin.Manager
-	pluginProxy *plugin.Proxy
-	serviceMgr  *service.Manager
-	fileMgr     *file.Manager
-	siteMgr     *site.Manager
-	handler     http.Handler
-	httpSrv     *http.Server
+	opts         Options
+	logger       *slog.Logger
+	auth         *auth.Authenticator
+	sysinfo      *sysinfo.Collector
+	plugins      *plugin.Manager
+	pluginProxy  *plugin.Proxy
+	serviceMgr   *service.Manager
+	fileMgr      *file.Manager
+	siteMgr      *site.Manager
+	sslMgr       *ssl.Manager
+	sslScheduler *ssl.RenewScheduler
+	handler      http.Handler
+	httpSrv      *http.Server
 }
 
 // New 根据 opts 构建 Server。返回错误说明配置非法，调用方应据此终止启动。
@@ -130,6 +147,10 @@ func New(opts Options) (*Server, error) {
 
 	// 站点管理（阶段四 4.3）：同上。未注入时 /api/sites 返回 503。
 	s.siteMgr = opts.Sites
+
+	// SSL 证书管理（阶段四 4.4）：同上。未注入时 /api/ssl 返回 503。
+	s.sslMgr = opts.SSL
+	s.sslScheduler = opts.SSLScheduler
 
 	mux := http.NewServeMux()
 	// 服务路由由 registerAPIRoutes 内部统一注册（核心自带功能，

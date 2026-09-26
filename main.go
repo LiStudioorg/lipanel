@@ -34,6 +34,7 @@ import (
 	"lipanel/internal/server"
 	"lipanel/internal/service"
 	"lipanel/internal/site"
+	"lipanel/internal/ssl"
 )
 
 // distFS 承载 web/dist 下的全部前端产物。
@@ -123,6 +124,21 @@ func run() error {
 				"用于解析它 include 了哪些站点目录")
 		nginxCommandTimeout = flag.Duration("nginx-timeout", site.DefaultCommandTimeout,
 			"单次 nginx 命令（-t 校验 / -s reload）的超时（如 30s、1m）")
+
+		certbotPath = flag.String("certbot-path", "",
+			"certbot 可执行文件路径（留空则按 PATH 查找 certbot，再退到 acme.sh）")
+		certbotEmail = flag.String("certbot-email", "",
+			"Let's Encrypt 账号邮箱（留空仍可签发，但收不到到期提醒）")
+		certRenewDays = flag.Int("cert-renew-days", ssl.DefaultRenewDays,
+			"证书剩余天数低于此值时判定为「即将过期」，并纳入自动续期（默认 30）")
+		certRenewInterval = flag.Duration("cert-renew-interval", ssl.DefaultRenewInterval,
+			"自动续期的检查间隔（默认 12h）；设为 0 可关闭自动续期")
+		certDryRun = flag.Bool("cert-dry-run", false,
+			"试运行模式：使用 ACME staging 环境且不写入证书文件。"+
+				"该模式**不消耗**生产配额，适合先验证域名解析与 80 端口是否就绪")
+		certCommandTimeout = flag.Duration("cert-timeout", ssl.DefaultCommandTimeout,
+			"单次 certbot 命令的超时（如 2m、5m）。"+
+				"申请需要与 CA 多次往返，超时设置过短会导致「证书已签发但本地未拿到」")
 	)
 	flag.Parse()
 
@@ -368,6 +384,111 @@ func run() error {
 		)
 	}
 
+	// SSL 证书管理器（阶段四 4.4，核心自带）。
+	//
+	// 审计同样是「统一落盘、分别查询」：与插件/服务/文件/站点审计
+	// 共用同一个 -audit-log 文件（JSONL 追加写），但有独立的类型、
+	// 环形缓冲与查询接口（/api/ssl/audit），互不污染。
+	sslAuditor, err := ssl.NewAuditor(ssl.AuditOptions{
+		Capacity: *pluginAuditBuf,
+		Path:     *pluginAuditLog,
+		Logger:   logger,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sslAuditor.Close() }()
+
+	// 站点提供器：把 site.Manager 适配成 ssl 包需要的最小视图。
+	//
+	// 用适配器而不是让 ssl 包直接依赖 site.Manager，有两个理由：
+	//
+	//	① 避免 ssl → site 的包依赖（site 也需要 ssl 的证书路径概念，
+	//	   直接互相 import 会形成环）；
+	//	② 更重要的是**收窄能力**：适配器只暴露证书模块真正需要的
+	//	   四个字段，"证书模块会不会顺手改站点"这个问题
+	//	   在类型层面就有了答案——它拿到的信息不足以做别的事。
+	sslSiteProvider := &sslSiteAdapter{mgr: siteManager}
+
+	// 配置写入器：把 SSL 配置交回 4.3 的 site.Manager 渲染与落盘。
+	//
+	// ########## 为什么必须走 site.Manager 而不是自己写文件 ##########
+	//
+	// 证书配置写错 = **整台机器的 HTTPS 全部不可用**。
+	// site.Manager.SetSSL 复用的是 4.3 已经做对并被测试锁死的链路：
+	//
+	//	快照（配置内容 + 启用链接 + disabled 文件）
+	//	→ 写盘 → nginx -t ─┬─ 通过 → reload ─┬─ 成功 → 完成
+	//	                   │                 └─ 失败 → 回滚 → 复验
+	//	                   └─ 失败 → 回滚 → 复验
+	//
+	// 让 ssl 包自己写配置，等于把这套带测试的链路复制一份，
+	// 而复制品一旦出问题，用户丢的是全部站点的 HTTPS。
+	sslRewriter := &sslConfigRewriter{mgr: siteManager}
+
+	sslManager, err := ssl.NewManager(ssl.ManagerOptions{
+		Logger: logger,
+		Detector: ssl.NewDetector(ssl.DetectorOptions{
+			CertbotPath: *certbotPath,
+			Logger:      logger,
+		}),
+		Sites:          sslSiteProvider,
+		Rewriter:       sslRewriter,
+		Auditor:        sslAuditor,
+		Email:          *certbotEmail,
+		RenewDays:      *certRenewDays,
+		CommandTimeout: *certCommandTimeout,
+		DryRun:         *certDryRun,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化 SSL 证书管理失败: %w", err)
+	}
+
+	// 自动续期调度器（阶段四 4.4）。
+	//
+	// -cert-renew-interval 0 表示**不启动**调度器（只用手动续期）。
+	// 这与"间隔为 0 时用默认值"不同，因此需要显式判断
+	// （坑位 12：零值无法表达"我确实想要 0"）。
+	var sslScheduler *ssl.RenewScheduler
+	if *certRenewInterval != 0 {
+		sslScheduler = ssl.NewRenewScheduler(ssl.RenewSchedulerOptions{
+			Manager:  sslManager,
+			Interval: *certRenewInterval,
+			DryRun:   *certDryRun,
+			Logger:   logger,
+		})
+	}
+
+	// 探测一次 ACME 客户端可用性，把结论打进启动日志。
+	//
+	// 为什么在启动时主动探测（而不是等第一次请求）：
+	// "这台机器能不能申请证书"是运维最关心的启动信息之一，
+	// 而探测失败**不阻断启动**（面板其它功能必须照常可用，
+	// 与 4.1 无 systemd 的降级策略一致）。
+	if sslManager.Available() {
+		cap := sslManager.Capabilities(context.Background())
+		if cap.Available {
+			logger.Info("SSL 证书管理已就绪",
+				"client", cap.Client.Kind,
+				"path", cap.Client.Path,
+				"version", cap.Client.Version,
+				"challenge", cap.ChallengeType,
+				"renew_days", cap.RenewDays,
+				"dry_run", cap.DryRun,
+				"auto_renew", sslScheduler != nil,
+			)
+			for _, note := range cap.Notes {
+				logger.Info("SSL 提示", "note", note)
+			}
+		} else {
+			logger.Warn("SSL 证书管理不可用，面板其它功能不受影响",
+				"reason", cap.Reason)
+		}
+	} else {
+		logger.Warn("SSL 证书管理不可用，面板其它功能不受影响",
+			"reason", sslManager.UnavailableReason())
+	}
+
 	// 注入内嵌前端资源（go:embed 在根目录，见本文件顶部 distFS）。
 	// 仅在没有用 -static-dir 覆盖时才需要解析；解析失败属构建错误，直接终止。
 	var (
@@ -394,6 +515,10 @@ func run() error {
 		Services:  serviceManager,
 		Files:     fileManager,
 		Sites:     siteManager,
+		SSL:       sslManager,
+		// 调度器单独注入：它是可选的（用户可能只想手动续期），
+		// 而状态接口需要在它不存在时也能正常返回。
+		SSLScheduler: sslScheduler,
 	})
 	if err != nil {
 		return err
@@ -402,6 +527,18 @@ func run() error {
 	// 监听 SIGINT/SIGTERM，实现优雅关闭。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// 启动自动续期调度（阶段四 4.4）。
+	//
+	// 放在 ctx 建立之后：调度器随主进程的退出信号一起结束，
+	// 因此**不会留下孤儿 goroutine** 在关闭过程中拉起 certbot。
+	// Close 会等待 goroutine 真正退出（不只是发个取消信号），
+	// 因此下面的 defer 能保证进程退出前续期任务已完全停止——
+	// 这正是坑位 16 那类"看起来停了、其实还在跑"的同一个问题。
+	if sslScheduler != nil {
+		sslScheduler.Start(ctx)
+		defer func() { _ = sslScheduler.Close() }()
+	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.ListenAndServe() }()
@@ -575,3 +712,100 @@ func buildAuthenticator(logger *slog.Logger, cfg *config.Config, configPath stri
 // defaultDevPassword 是未配置密码时使用的开发口令。
 // 刻意保持简短好记，以便本地联调；启动时必定打印 WARN 提醒替换。
 const defaultDevPassword = "admin123"
+
+// ============================================================================
+// SSL 与站点模块之间的适配器（阶段四 4.4）
+// ============================================================================
+//
+// 这两个类型是 ssl 包与 site 包之间**唯一**的接触面。
+//
+// ########## 为什么用适配器而不是让两个包互相 import ##########
+//
+// ssl 需要 site 的"写入配置"能力，site 需要 ssl 的"证书路径"概念。
+// 直接互相 import 会形成**循环依赖**，Go 编译器不会允许。
+//
+// 但这不只是绕开编译器限制——适配器同时收窄了能力：
+//
+//	sslSiteAdapter     只暴露证书模块真正需要的 4 个字段，
+//	                   因此"证书模块顺手改站点配置"在类型层面就不可能；
+//	sslConfigRewriter  只暴露"应用/移除 SSL"两个动作，
+//	                   证书模块无法借它去删除站点或改域名。
+//
+// 与 4.3 用 RootChecker 闭包避免 site → file 依赖是同一个手法。
+
+// sslSiteAdapter 把 site.Manager 适配成 ssl.SiteProvider。
+type sslSiteAdapter struct {
+	mgr *site.Manager
+}
+
+// GetSite 返回单个站点的最小视图。
+func (a *sslSiteAdapter) GetSite(name string) (ssl.SiteRef, error) {
+	s, err := a.mgr.Get(name)
+	if err != nil {
+		return ssl.SiteRef{}, err
+	}
+	return toSiteRef(s), nil
+}
+
+// ListSites 返回全部站点的最小视图。
+func (a *sslSiteAdapter) ListSites() ([]ssl.SiteRef, error) {
+	list, err := a.mgr.List()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ssl.SiteRef, 0, len(list))
+	for _, s := range list {
+		out = append(out, toSiteRef(s))
+	}
+	return out, nil
+}
+
+// toSiteRef 把 site.Site 映射成 ssl 需要的最小视图。
+//
+// 刻意只搬运 4 个字段：证书模块不需要知道站点的启用状态之外
+// 任何"能改站点"的信息。
+func toSiteRef(s site.Site) ssl.SiteRef {
+	return ssl.SiteRef{
+		Name:       s.Name,
+		Domain:     s.Domain,
+		Root:       s.Root,
+		Upstream:   s.Upstream,
+		Type:       s.Type,
+		Enabled:    s.Enabled,
+		ConfigPath: s.ConfigPath,
+	}
+}
+
+// sslConfigRewriter 把 ssl.ConfigRewriter 的实现委托给 site.Manager。
+//
+// 它存在的意义只有一个：**让证书配置走 4.3 已验证的回滚链路**。
+// 这里不做任何自己的文件操作——那正是要避免的事。
+type sslConfigRewriter struct {
+	mgr *site.Manager
+}
+
+// ApplySSL 把 TLS 配置写入站点（走 site.Manager 的完整校验与回滚链路）。
+func (r *sslConfigRewriter) ApplySSL(ctx context.Context, siteName string, cfg ssl.SSLConfig) error {
+	_, err := r.mgr.SetSSL(ctx, siteName, &site.SSLConfig{
+		CertPath:     cfg.CertPath,
+		KeyPath:      cfg.KeyPath,
+		RedirectHTTP: cfg.RedirectHTTP,
+		Protocols:    cfg.Protocols,
+		Ciphers:      cfg.Ciphers,
+	})
+	if err != nil {
+		// 把 site 包的错误原样带上去（含"是否已回滚"的信息）：
+		// 调用方（ssl.Manager）需要它来判断这是"配置没写成功"
+		// 还是"写坏了但已自动恢复"——两者对用户的含义完全不同。
+		return fmt.Errorf("site: %w", err)
+	}
+	return nil
+}
+
+// RemoveSSL 从站点配置中移除 TLS 设置（回到纯 HTTP）。
+func (r *sslConfigRewriter) RemoveSSL(ctx context.Context, siteName string) error {
+	if _, err := r.mgr.SetSSL(ctx, siteName, nil); err != nil {
+		return fmt.Errorf("site: %w", err)
+	}
+	return nil
+}

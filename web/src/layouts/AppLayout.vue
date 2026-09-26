@@ -43,6 +43,10 @@ const builtinMenus = [
   // 网站管理（阶段四 4.3）：内置页面而非插件——
   // nginx 站点是面板对外提供服务的基础能力。
   { key: 'site-manager', label: '网站管理', icon: '🌐', to: { name: 'site-manager' } },
+  // SSL 证书（阶段四 4.4）：内置页面而非插件——
+  // 证书是面板对外提供服务的基础能力，且到期不处理会直接导致
+  // 站点无法访问，必须始终可达。
+  { key: 'ssl-cert', label: 'SSL 证书', icon: '🔒', to: { name: 'ssl-cert' } },
   { key: 'plugins', label: '插件管理', icon: '🧩', to: { name: 'plugin-list' } },
   // 审计页（阶段三 3.3）：权限声明是"拒绝对了没"的唯一可见证据，
   // 因此把它放在一级菜单，而不是藏进插件详情里。

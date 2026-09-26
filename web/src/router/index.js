@@ -60,6 +60,21 @@ const routes = [
     meta: { title: '网站管理' },
   },
   {
+    // SSL 证书页（阶段四 4.4）。
+    //
+    // 同样是核心内置能力 + 静态路由（与 /services、/files、/sites
+    // 相同的架构决定）：证书是面板对外提供服务的基础能力，
+    // 不该依赖插件机制是否可用。
+    //
+    // 路径用 /ssl 而不是 /sites/ssl：证书是独立的一级概念
+    // （它有自己的审计、权限与运行状态），挂在站点下会让人
+    // 误以为"没有站点就没有证书"。后端的接口同样是独立的 /api/ssl。
+    path: '/ssl',
+    name: 'ssl-cert',
+    component: () => import('@/views/SslView.vue'),
+    meta: { title: 'SSL 证书' },
+  },
+  {
     // 插件操作审计页（阶段三 3.3）。
     // 必须放在 "/plugins/:id" 之前：否则 "audit" 会被当成插件 ID
     // 命中了通配路由，打开审计页会变成"插件 audit 不存在"。

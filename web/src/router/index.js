@@ -50,6 +50,16 @@ const routes = [
     meta: { title: '文件管理' },
   },
   {
+    // 网站管理页（阶段四 4.3）。
+    //
+    // 同样是核心内置能力 + 静态路由（与 /services、/files 相同的架构决定）：
+    // nginx 站点是面板的基础运维能力，不该依赖插件机制是否可用。
+    path: '/sites',
+    name: 'site-manager',
+    component: () => import('@/views/SiteView.vue'),
+    meta: { title: '网站管理' },
+  },
+  {
     // 插件操作审计页（阶段三 3.3）。
     // 必须放在 "/plugins/:id" 之前：否则 "audit" 会被当成插件 ID
     // 命中了通配路由，打开审计页会变成"插件 audit 不存在"。

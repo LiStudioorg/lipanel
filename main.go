@@ -33,6 +33,7 @@ import (
 	"lipanel/internal/plugin"
 	"lipanel/internal/server"
 	"lipanel/internal/service"
+	"lipanel/internal/site"
 )
 
 // distFS 承载 web/dist 下的全部前端产物。
@@ -113,6 +114,15 @@ func run() error {
 			"单次上传文件的大小上限（字节，默认 128MiB）")
 		fileMaxEdit = flag.Int64("file-max-edit", file.DefaultMaxEditBytes,
 			"内置文本编辑器可打开/保存的最大文件（字节，默认 2MiB）")
+
+		nginxPrefix = flag.String("nginx-prefix", "",
+			"nginx 的 prefix 目录（留空则自动探测 /etc/nginx）；"+
+				"站点管理会读写其下的 sites-available/sites-enabled 或 conf.d")
+		nginxConf = flag.String("nginx-conf", "",
+			"nginx 主配置路径（留空则为 <nginx-prefix>/nginx.conf）；"+
+				"用于解析它 include 了哪些站点目录")
+		nginxCommandTimeout = flag.Duration("nginx-timeout", site.DefaultCommandTimeout,
+			"单次 nginx 命令（-t 校验 / -s reload）的超时（如 30s、1m）")
 	)
 	flag.Parse()
 
@@ -283,6 +293,81 @@ func run() error {
 			"hint", "如需收窄范围，可用 -file-root /home,/etc/nginx 指定白名单目录")
 	}
 
+	// 站点管理器（阶段四 4.3，核心自带）。
+	//
+	// 审计同样是「统一落盘、分别查询」：与插件/服务/文件审计共用同一个
+	// -audit-log 文件（JSONL 追加写），但有独立的类型、环形缓冲与查询接口
+	// （/api/sites/audit），互不污染。
+	siteAuditor, err := site.NewAuditor(site.AuditOptions{
+		Capacity: *pluginAuditBuf,
+		Path:     *pluginAuditLog,
+		Logger:   logger,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = siteAuditor.Close() }()
+
+	// nginx 目录布局适配器：探测 sites-available/sites-enabled 还是 conf.d。
+	//
+	// 探测依据是 nginx.conf 里**真实的 include 行**，而不是猜发行版名字
+	// （用户完全可以自定义 nginx.conf，容器镜像里也常见
+	// 「Ubuntu 的 os-release + 自写的 nginx.conf」这种组合）。
+	siteAdapter := site.NewSystemAdapter(site.AdapterOptions{
+		Prefix:   *nginxPrefix,
+		ConfPath: *nginxConf,
+	})
+
+	// RootChecker 把「静态站根目录」的两道闸门合成一次判定：
+	//
+	//	① 4.2 的路径白名单（file.Resolver）——回答「这个路径能不能碰」；
+	//	② 存在且是目录                   ——回答「这个路径现在能不能用」。
+	//
+	// 通过闭包注入而不是让 site 包 import file 包：那会让两个核心模块
+	// 形成依赖环，而这里真正需要的只是"一个判断路径是否可用的函数"。
+	//
+	// 复用 4.2 的白名单是刻意的：站点根目录就是文件管理能碰到的那些目录，
+	// 两处若各有一套规则，用户就会遇到"文件管理里能看到的目录，
+	// 建站时却说不合法"这种无从解释的偏差。
+	siteRootChecker := func(path string) error {
+		real, err := fileManager.Resolver().ResolveExisting(path)
+		if err != nil {
+			return fmt.Errorf("站点根目录不在允许范围内: %w", err)
+		}
+		info, err := os.Stat(real)
+		if err != nil {
+			return fmt.Errorf("站点根目录不可用: %w", err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("站点根目录 %s 不是目录", real)
+		}
+		return nil
+	}
+
+	siteManager, err := site.NewManager(site.ManagerOptions{
+		Logger:         logger,
+		Adapter:        siteAdapter,
+		Auditor:        siteAuditor,
+		CommandTimeout: *nginxCommandTimeout,
+		RootChecker:    siteRootChecker,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化站点管理失败: %w", err)
+	}
+	// 无 nginx 时只告警不阻断：面板其它功能必须照常可用
+	// （与 4.1 无 systemd 的降级策略完全一致）。
+	if !siteManager.Available() {
+		logger.Warn("站点管理不可用，面板其它功能不受影响",
+			"reason", siteManager.UnavailableReason())
+	} else {
+		logger.Info("站点管理已就绪",
+			"nginx", siteAdapter.Executable(),
+			"mode", siteAdapter.Mode(),
+			"available_dir", siteAdapter.AvailableDir(),
+			"enabled_dir", siteAdapter.EnabledDir(),
+		)
+	}
+
 	// 注入内嵌前端资源（go:embed 在根目录，见本文件顶部 distFS）。
 	// 仅在没有用 -static-dir 覆盖时才需要解析；解析失败属构建错误，直接终止。
 	var (
@@ -308,6 +393,7 @@ func run() error {
 		Plugins:   pluginManager,
 		Services:  serviceManager,
 		Files:     fileManager,
+		Sites:     siteManager,
 	})
 	if err != nil {
 		return err

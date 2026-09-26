@@ -37,6 +37,17 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// 同样是核心自带能力（不做成插件）：新增 file_api.go 承载 handler，
 	// internal/file 承载路径安全、权限与审计。这里只负责"登记"。
 	s.registerFileRoutes(mux)
+
+	// ---------- 网站管理（阶段四 4.3，核心自带）----------
+	//
+	// 与 4.1/4.2 同一套架构：site_api.go 承载 handler，
+	// internal/site 承载配置生成、nginx -t 校验与自动回滚、权限与审计。
+	//
+	// ⚠️ 该注册函数内部有**顺序要求**（/api/sites/audit 与
+	// /api/sites/capabilities 必须先于 /api/sites/{name} 注册），
+	// 已由 registerSiteRoutes 集中处理，详见其注释与
+	// site_api_test.go 中锁死该行为的测试。
+	s.registerSiteRoutes(mux)
 }
 
 // healthResponse 是 /api/health 的响应体，字段使用 snake_case 以便前端直接消费。

@@ -19,6 +19,7 @@ import (
 	"lipanel/internal/file"
 	"lipanel/internal/plugin"
 	"lipanel/internal/service"
+	"lipanel/internal/site"
 	"lipanel/internal/sysinfo"
 )
 
@@ -60,6 +61,13 @@ type Options struct {
 	// 它的可用性完全由「有没有配白名单根目录」决定，而这在构造
 	// file.Manager 时就已经确定（没有根目录直接构造失败）。
 	Files *file.Manager
+	// Sites 提供 nginx 站点管理能力（阶段四 4.3，核心自带）。
+	// 为 nil 时站点相关接口返回 JSON 503（与 Plugins/Services 同样的降级策略）。
+	//
+	// 与 Services 一样，即使注入了 Manager，系统本身没有 nginx 时
+	// 它也只会返回「不可用」而不是报错——降级判断在 site 包内
+	// （由 SystemAdapter 探测目录布局得出结论），这里不重复判断。
+	Sites *site.Manager
 }
 
 // Server 封装 HTTP 服务及其依赖。
@@ -72,6 +80,7 @@ type Server struct {
 	pluginProxy *plugin.Proxy
 	serviceMgr  *service.Manager
 	fileMgr     *file.Manager
+	siteMgr     *site.Manager
 	handler     http.Handler
 	httpSrv     *http.Server
 }
@@ -118,6 +127,9 @@ func New(opts Options) (*Server, error) {
 
 	// 文件管理（阶段四 4.2）：同上。
 	s.fileMgr = opts.Files
+
+	// 站点管理（阶段四 4.3）：同上。未注入时 /api/sites 返回 503。
+	s.siteMgr = opts.Sites
 
 	mux := http.NewServeMux()
 	// 服务路由由 registerAPIRoutes 内部统一注册（核心自带功能，

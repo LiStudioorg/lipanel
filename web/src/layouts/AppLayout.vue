@@ -40,6 +40,9 @@ const builtinMenus = [
   // 文件管理（阶段四 4.2）：同样是内置页面而非插件——
   // 文件读写是面板最核心的运维能力之一。
   { key: 'file-manager', label: '文件管理', icon: '📁', to: { name: 'file-manager' } },
+  // 网站管理（阶段四 4.3）：内置页面而非插件——
+  // nginx 站点是面板对外提供服务的基础能力。
+  { key: 'site-manager', label: '网站管理', icon: '🌐', to: { name: 'site-manager' } },
   { key: 'plugins', label: '插件管理', icon: '🧩', to: { name: 'plugin-list' } },
   // 审计页（阶段三 3.3）：权限声明是"拒绝对了没"的唯一可见证据，
   // 因此把它放在一级菜单，而不是藏进插件详情里。

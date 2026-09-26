@@ -45,6 +45,18 @@ tmp/
 coverage.txt
 *.out
 
+# ---------- 本地端到端测试实例 ----------
+# .e2e/ 是为验证网站管理（4.3）在**工作区内**起的一个真实 nginx 实例：
+# 它有自己的 nginx.conf / sites-available / sites-enabled / 运行日志与 pid。
+#
+# 之所以需要它：开发沙箱是 workspace-write，/etc/nginx 不可写，而
+# `nginx -t` 与 reload 必须打到**真实实例**上才算验证过（本阶段的硬性要求），
+# 因此用 `-nginx-prefix` 指到工作区内。
+#
+# **绝不能入库**：含本机绝对路径、运行期 pid 与日志，且每次测试都会变。
+# 需要复现时按开发计划 4.3「验证记录」的说明重建即可。
+.e2e/
+
 # ---------- 编辑器 / IDE ----------
 .idea/
 .vscode/

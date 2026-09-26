@@ -6,7 +6,9 @@
 
 # 前端
 web/node_modules/
-web/dist/
+# 前端构建产物不入库，但保留占位文件（go:embed 需要目录非空）
+web/dist/*
+!web/dist/.gitkeep
 
 # 测试与覆盖率
 *.test

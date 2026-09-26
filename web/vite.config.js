@@ -54,13 +54,43 @@ export default defineConfig({
       apply: 'serve',
       configureServer(server) {
         server.middlewares.use((req, res, next) => {
-          if ((req.url || '').split('?')[0] !== '/assets/vue.js') return next()
-          res.setHeader('Content-Type', 'text/javascript')
-          res.setHeader('Cache-Control', 'no-cache')
-          res.end(
-            "import * as vue from 'vue'\n" +
-              'window.__LIPANEL__ = { ...(window.__LIPANEL__ || {}), vue }\n',
-          )
+          const path = (req.url || '').split('?')[0]
+
+          if (path === '/assets/vue.js') {
+            res.setHeader('Content-Type', 'text/javascript')
+            res.setHeader('Cache-Control', 'no-cache')
+            res.end(
+              "import * as vue from 'vue'\n" +
+                'window.__LIPANEL__ = { ...(window.__LIPANEL__ || {}), vue }\n',
+            )
+            return
+          }
+
+          // 插件沙箱 iframe 的 Vue 入口（阶段三 3.3）。
+          //
+          // 与 /assets/vue.js 同样的道理：它是 importmap 指向的**固定路径**，
+          // 所以 dev 下也必须真的存在且 Content-Type 是 JS。
+          // 否则 iframe 里的 `import 'vue'` 会拿到 SPA 兜底的 200 + text/html，
+          // 被浏览器按 MIME 拒绝执行，表现为「dev 下插件沙箱白屏、构建后正常」。
+          // 内容与源码 web/plugins/plugin-assets/frame/plugin-runtime.js 等价，
+          // 但由 Vite 转换其 `import 'vue'`（保证与 iframe 内插件解析到同一个实例）。
+          if (path === '/assets/plugin-runtime.js') {
+            res.setHeader('Content-Type', 'text/javascript')
+            res.setHeader('Cache-Control', 'no-cache')
+            res.end(
+              "import * as vue from 'vue'\n" +
+                'const host = window.__LIPANEL__\n' +
+                'if (host) {\n' +
+                '  host.vue = vue\n' +
+                "  if (typeof host.__resolveVue === 'function') host.__resolveVue(vue)\n" +
+                '  delete host.__resolveVue\n' +
+                '  delete host.__rejectVue\n' +
+                '}\n',
+            )
+            return
+          }
+
+          return next()
         })
       },
     },
@@ -80,19 +110,34 @@ export default defineConfig({
       name: 'lipanel-runtime-entry',
       apply: 'build',
       generateBundle(_options, bundle) {
-        const chunk = bundle['assets/runtime.js']
-        if (!chunk) return
-        chunk.fileName = 'assets/vue.js'
-        // 同步修正引用该 chunk 的其它 bundle（index.html / 动态 import）。
+        // 需要改名的入口：源文件 → 固定的运行时路径。
+        //
+        //   src/runtime.js          → /assets/vue.js
+        //     宿主页面 importmap 里裸说明符 "vue" 的目标（3.2 起）
+        //   src/frame-runtime.js    → /assets/plugin-runtime.js
+        //     插件沙箱 iframe 里 importmap 的目标（3.3 新增）
+        //
+        // 两者都必须落在**不带内容哈希**的固定路径上，否则 importmap
+        // 没法写死目标；而 Vite 默认给入口 chunk 带哈希，因此只能在此改名。
+        const renames = {
+          'assets/runtime.js': 'assets/vue.js',
+          // 注意 key 用的是 **入口名**（rollupOptions.input 的键 frameRuntime），
+          // 不是源文件名 frame-runtime.js —— Vite 产出的是 assets/frameRuntime.js。
+          'assets/frameRuntime.js': 'assets/plugin-runtime.js',
+        }
+
+        for (const [from, to] of Object.entries(renames)) {
+          const chunk = bundle[from]
+          if (!chunk) continue
+          chunk.fileName = to
+        }
+
+        // 同步修正引用这些 chunk 的其它 bundle（index.html / 动态 import）。
+        const resolve = (name) => renames[name] || name
         for (const item of Object.values(bundle)) {
-          if (item.type === 'chunk' && item.imports) {
-            item.imports = item.imports.map((i) => (i === 'assets/runtime.js' ? 'assets/vue.js' : i))
-          }
-          if (item.type === 'chunk' && item.dynamicImports) {
-            item.dynamicImports = item.dynamicImports.map((i) =>
-              i === 'assets/runtime.js' ? 'assets/vue.js' : i,
-            )
-          }
+          if (item.type !== 'chunk') continue
+          if (item.imports) item.imports = item.imports.map(resolve)
+          if (item.dynamicImports) item.dynamicImports = item.dynamicImports.map(resolve)
         }
       },
     },
@@ -143,13 +188,22 @@ export default defineConfig({
         // "vue" 固定指向一个**稳定路径**（/assets/vue.js），而带哈希的
         // 资源名做不到这一点。做法见本文件末尾的 lipanel-runtime-entry 插件。
         runtime: fileURLToPath(new URL('./src/runtime.js', import.meta.url)),
+        // 插件沙箱 iframe 的 Vue 入口（阶段三 3.3）。
+        // iframe 是 opaque origin，无法直接用宿主 window 上的 Vue，
+        // 必须在自己的 Realm 里加载一份 → 由它提供固定路径 /assets/plugin-runtime.js。
+        frameRuntime: fileURLToPath(new URL('./src/frame-runtime.js', import.meta.url)),
       },
       output: {
         // 只对入口 chunk 固定命名；带哈希的普通 chunk 仍走默认策略。
         //
         // 注意不要改成 chunkFileNames：那会波及 index.html 引用的主 chunk，
         // 页面直接白屏。这里只固定入口名，且入口只有 runtime 一个非 HTML 入口。
-        entryFileNames: (chunk) => (chunk.name === 'runtime' ? 'assets/[name].js' : 'assets/[name]-[hash].js'),
+        // runtime 与 frameRuntime 都要固定名（它们各自的 importmap 需要稳定路径）；
+        // 其余入口仍带哈希。
+        entryFileNames: (chunk) =>
+          chunk.name === 'runtime' || chunk.name === 'frameRuntime'
+            ? 'assets/[name].js'
+            : 'assets/[name]-[hash].js',
       },
     },
   },

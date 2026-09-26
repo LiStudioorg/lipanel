@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>插件沙箱</title>
+
+    <!--
+      插件前端沙箱页（阶段三 3.3）。
+
+      这个页面被 <iframe sandbox="allow-scripts"> 加载，**刻意不给
+      allow-same-origin**，因此它处于 opaque origin：
+        · document.cookie 读不到
+        · localStorage / sessionStorage 不可用
+        · fetch('/api/*') 不带会话 Cookie（会被后端 401）
+      插件代码在这里运行，能做的事只剩「渲染 + 通过 postMessage 请宿主代取数据」。
+
+      为什么不让 iframe 直接从 URL 拿插件入口地址：
+      src 里只带一个 id，真正的入口地址由宿主在握手后用 postMessage 下发
+      （见 plugin-frame.js 的 mount）。这样即使有人手工构造 iframe URL，
+      也无法让 iframe 去加载别的插件前端。
+
+      import map：插件前端写 `import { h, ref } from 'vue'` 时，
+      "vue" 必须解析到宿主共享的那一份 Vue 实例（否则插件里的 ref 来自
+      另一套响应式系统，会出现「数据变了视图不动」这类极难定位的问题）。
+      /assets/plugin-runtime.js 在 iframe 自己的 Realm 里导出宿主同款的 Vue。
+    -->
+    <script type="importmap">
+      {
+        "imports": {
+          "vue": "/assets/plugin-runtime.js"
+        }
+      }
+    </script>
+
+    <style>
+      /* 基础样式：与宿主保持一致的中性底色与字体，
+         避免 iframe 出现一块与面板格格不入的白底或黑底。 */
+      :root {
+        color-scheme: light dark;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue',
+          'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      /* 颜色一律继承宿主主题（宿主通过 postMessage 下发 theme，
+         本页只提供透明背景），避免插件界面出现突兀的色块。 */
+      body {
+        color: inherit;
+      }
+      #app {
+        padding: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+
+    <!-- 顺序很重要：
+         1) plugin-runtime.js —— 先建立 Vue 实例并 resolve vueReady
+         2) plugin-frame.js  —— 再跑引导流程（await vueReady 后加载插件）
+         两步都用 module（默认 defer），按文档顺序执行。 -->
+    <script type="module" src="/plugin-assets/frame/plugin-runtime.js"></script>
+    <script type="module" src="/plugin-assets/frame/plugin-frame.js"></script>
+  </body>
+</html>

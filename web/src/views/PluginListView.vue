@@ -13,6 +13,7 @@ import { ApiError } from '@/api/client'
 import { authStore } from '@/stores/auth'
 import {
   checkPluginHealth,
+  fetchAuditLog,
   fetchPlugins,
   restartPlugin,
   startPlugin,
@@ -30,6 +31,9 @@ const loading = ref(false)
 const error = ref('')
 const plugins = ref([])
 const socketDir = ref('')
+// auditStats 是后端返回的全局审计统计；byPlugin 用于按插件显示拒绝次数。
+const auditStats = ref(null)
+const auditByPlugin = ref({})
 
 // busy 记录每个插件正在执行的操作，用于按钮级 Loading。
 // 用对象而不是单个布尔量：操作 A 插件时不该让 B 插件的按钮也转圈。
@@ -56,6 +60,11 @@ async function load({ silent = false } = {}) {
     const data = await fetchPlugins()
     plugins.value = data.plugins || []
     socketDir.value = data.socket_dir || ''
+    auditStats.value = data.audit || null
+    // by_plugin 只在审计接口里返回（插件列表接口只带全局统计）。
+    // 这里额外拉一次，用于给"有拒绝记录"的插件行加提示；
+    // 失败不影响主流程——它是锦上添花的信息。
+    loadAuditByPlugin()
     // 登记前端入口：下面 hasPluginView(p.id) 的同步判定依赖它。
     applyPlugins(plugins.value)
   } catch (err) {
@@ -166,6 +175,23 @@ function modeText(mode) {
   return mode || '-'
 }
 
+// loadAuditByPlugin 拉取"按插件分组"的审计统计（只取 1 条记录，
+// 目的只是拿到 by_plugin 字段，避免把整个审计缓冲传到管理页）。
+async function loadAuditByPlugin() {
+  try {
+    const data = await fetchAuditLog({ limit: 1 })
+    auditByPlugin.value = data.by_plugin || {}
+  } catch {
+    // 审计不可用不该影响插件管理页：静默降级，只是不显示拒绝次数。
+    auditByPlugin.value = {}
+  }
+}
+
+// pluginDenied 返回该插件被拒绝的次数（无记录时为 0）。
+function pluginDenied(id) {
+  return auditByPlugin.value?.[id]?.denied ?? 0
+}
+
 const runningCount = computed(() => plugins.value.filter((p) => p.state === 'running').length)
 const summary = computed(() => `共 ${plugins.value.length} 个插件，${runningCount.value} 个运行中`)
 </script>
@@ -191,6 +217,15 @@ const summary = computed(() => `共 ${plugins.value.length} 个插件，${runnin
           <code>/api/plugins/&lt;id&gt;/*</code> 会被转发给对应插件。
           <template v-if="socketDir">
             <br />Socket 目录：<code>{{ socketDir }}</code>
+          </template>
+          <template v-if="auditStats">
+            <br />操作审计：累计 {{ auditStats.total }} 条<span
+              v-if="auditStats.denied"
+            >，其中 <strong>{{ auditStats.denied }}</strong> 条权限拒绝</span>
+            <template v-if="auditStats.persist_path">
+              （已落盘到 <code>{{ auditStats.persist_path }}</code>）
+            </template>
+            <template v-else>（仅内存，加 <code>-audit-log</code> 可落盘）</template>
           </template>
         </n-text>
 
@@ -252,6 +287,38 @@ const summary = computed(() => `共 ${plugins.value.length} 个插件，${runnin
                 {{ p.started_at ? formatTime(p.started_at) : '-' }}
               </n-descriptions-item>
             </n-descriptions>
+
+            <!-- 权限清单（阶段三 3.3）：让"这个插件能做什么"对用户可见。
+                 空清单要显式说明后果，而不是显示一片空白。 -->
+            <div class="perm-block">
+              <n-text depth="3" style="font-size: 12px">
+                已声明权限：
+                <template v-if="(p.permissions || []).length">
+                  <n-tag
+                    v-for="perm in p.permissions"
+                    :key="perm"
+                    size="tiny"
+                    :bordered="false"
+                    type="info"
+                    style="margin-right: 4px"
+                  >
+                    {{ perm }}
+                  </n-tag>
+                </template>
+                <template v-else>
+                  <n-tag size="tiny" :bordered="false" type="warning">未声明任何权限</n-tag>
+                  —— 除骨架接口外的一切转发调用都会被核心拒绝
+                </template>
+              </n-text>
+              <n-text
+                v-if="pluginDenied(p.id)"
+                depth="3"
+                style="font-size: 12px; display: block; margin-top: 4px"
+              >
+                审计记录中有 <strong>{{ pluginDenied(p.id) }}</strong> 次权限拒绝，
+                可到 <router-link :to="{ name: 'plugin-audit' }">插件审计</router-link> 页查看详情。
+              </n-text>
+            </div>
 
             <!-- 失败原因必须可见：否则用户只看到一个红标签，无从下手 -->
             <n-alert v-if="p.last_error" type="error" :bordered="false" title="最近一次错误">

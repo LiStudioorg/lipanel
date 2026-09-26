@@ -35,6 +35,9 @@ const pluginMenuError = ref('')
 const builtinMenus = [
   { key: 'dashboard', label: '系统概览', icon: '📊', to: { name: 'dashboard' } },
   { key: 'plugins', label: '插件管理', icon: '🧩', to: { name: 'plugin-list' } },
+  // 审计页（阶段三 3.3）：权限声明是"拒绝对了没"的唯一可见证据，
+  // 因此把它放在一级菜单，而不是藏进插件详情里。
+  { key: 'plugin-audit', label: '插件审计', icon: '📋', to: { name: 'plugin-audit' } },
 ]
 
 // pluginMenus 把「已运行 + 声明了前端入口」的插件转成菜单项。

@@ -1,17 +1,32 @@
 <script setup>
-// 插件前端宿主页 —— 「动态挂载插件前端」的挂载点。
+// 插件前端宿主页 —— 插件的挂载点。
 //
-// 职责非常单一：把路由参数 :id 交给前端注册表，由注册表动态 import
-// 插件自带的 ESM 入口并渲染。宿主本身不认识任何具体插件，
-// 因此新增插件时本文件无需改动。
+// 阶段三 3.2：把路由参数 :id 交给前端注册表，动态 import 插件自带的 ESM。
+// 阶段三 3.3：**默认改为 sandbox iframe 强隔离**（见 components/PluginFrame.vue）。
+//
+// 两种模式的区别（这是本页最重要的概念）：
+//
+//   隔离模式（默认）  sandbox iframe + postMessage 桥
+//                     插件代码跑在 opaque origin 里，读不到 document.cookie，
+//                     也无法直连 /api/*；要数据只能请宿主代取。
+//                     ← 用于运行不完全信任的插件前端。
+//
+//   兼容模式（?legacy=1 或 frontend.legacy=true）
+//                     3.2 的做法：与宿主共享 Realm，动态 import 后直接渲染。
+//                     插件能用宿主的 fetch 与会话、能读 cookie。
+//                     ← 只应在插件前端完全可信时使用。
+//
+// 兼容模式被保留（而不是删掉）的原因：迁移期需要一个对照物来定位
+// 「是插件的问题还是沙箱的问题」，同时让已有的可信插件不被破坏。
+// 但它**必须显式开启**：默认永远是安全的那一种。
 //
 // 四种情况都必须有明确兜底（不能白屏）：
 //   1. 插件不存在于后端列表        → 提示可能已被移除
 //   2. 插件存在但未声明前端入口    → 提示该插件只有后端能力
-//   3. 声明了入口但加载失败        → 展示具体原因 + 重试（3.2 新增）
+//   3. 声明了入口但加载失败        → 展示具体原因 + 重试
 //   4. 插件未运行                  → 提示先去插件管理页启动
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { fetchPlugins } from '@/api/plugins'
 import {
   applyPlugins,
@@ -20,8 +35,10 @@ import {
   resolvePluginView,
 } from '@/plugins/registry'
 import AppLayout from '@/layouts/AppLayout.vue'
+import PluginFrame from '@/components/PluginFrame.vue'
 
 const route = useRoute()
+const router = useRouter()
 
 const pluginId = computed(() => String(route.params.id || ''))
 
@@ -29,16 +46,38 @@ const loading = ref(false)
 const error = ref('')
 // plugin 是后端返回的该插件元数据；null 表示未找到。
 const plugin = ref(null)
-// loadError 是插件前端模块加载失败的原因（由 loader 记录）。
+// loadError 是插件前端模块加载失败的原因（兼容模式下的 loader 记录）。
 const loadError = ref('')
-// viewKey 用于「重试」：改变 key 强制 Vue 销毁并重新创建异步组件。
+// viewKey 用于「重试」：改变 key 强制 Vue 销毁并重新创建组件。
 const viewKey = ref(0)
 
-// 是否有前端入口（同步判定：只看清单，不触发加载）。
+// ---------- 隔离模式 / 兼容模式 ----------
+
+// legacyQuery 记录 URL 上是否显式要求兼容模式。
+const legacyQuery = computed(() => String(route.query.legacy || '') === '1')
+
+// sandboxDisabled 表示插件自己声明「我这个前端要跑在宿主 Realm 里」。
+// 这是一个**插件主动放弃隔离**的开关，后端 Descriptor.Frontend 里可设。
+const sandboxDisabled = computed(() => plugin.value?.frontend?.sandbox === false)
+
+// isolated 决定用哪种模式。默认隔离（true）。
+const isolated = computed(() => !legacyQuery.value && !sandboxDisabled.value)
+
+// hasFrontend 是否有前端入口（同步判定：只看清单，不触发加载）。
 const hasFrontend = computed(() => Boolean(plugin.value?.frontend?.entry))
 
-// viewComponent 只在「确实声明了入口」时解析，避免无谓的加载尝试。
-const viewComponent = computed(() => (hasFrontend.value ? resolvePluginView(pluginId.value) : null))
+// viewComponent 只在「兼容模式 + 确实声明了入口」时解析。
+// 隔离模式下不走这条路径，插件的 ESM 由 iframe 自己加载。
+const viewComponent = computed(() =>
+  !isolated.value && hasFrontend.value ? resolvePluginView(pluginId.value) : null,
+)
+
+// toggleMode 在两种模式间切换（写进 URL，便于刷新后保持与分享链接）。
+function toggleMode() {
+  router.replace({
+    query: { ...route.query, legacy: isolated.value ? '1' : undefined },
+  })
+}
 
 async function load() {
   loading.value = true
@@ -71,7 +110,7 @@ async function load() {
 function retry() {
   loadError.value = ''
   clearPluginView(pluginId.value)
-  // 换 key 让 Vue 丢弃上一个（失败的）异步组件实例并重新加载。
+  // 换 key 让 Vue 丢弃上一个（失败的）组件实例并重新加载。
   viewKey.value += 1
 }
 
@@ -82,12 +121,40 @@ watch(pluginId, () => {
   viewKey.value += 1
   load()
 })
+
+// 切换模式时也重建视图：两种模式加载的是完全不同的东西，
+// 复用同一个实例会让状态串味（例如沙箱的 error 留在兼容模式界面上）。
+watch(isolated, () => {
+  viewKey.value += 1
+  loadError.value = ''
+})
 </script>
 
 <template>
   <AppLayout>
     <n-spin :show="loading">
     <n-space vertical :size="16">
+      <!-- 当前加载模式：把「插件跑在哪」明确告诉用户。
+           隔离模式是安全的默认值，兼容模式必须显眼地标出来。 -->
+      <n-alert v-if="plugin && hasFrontend" :type="isolated ? 'success' : 'warning'" size="small">
+        <n-space align="center" justify="space-between">
+          <n-text style="font-size: 13px">
+            <template v-if="isolated">
+              <strong>隔离模式</strong>：插件前端运行在 sandbox iframe 中（无同源权限），
+              读不到会话 Cookie，也无法直连 <code>/api/*</code>，需数据时经 postMessage 请宿主代取。
+            </template>
+            <template v-else>
+              <strong>兼容模式（不安全）</strong>：插件前端与宿主共享 Realm，
+              可读取 <code>document.cookie</code> 并直连 <code>/api/*</code>。
+              仅应在插件前端完全可信时使用。
+            </template>
+          </n-text>
+          <n-button size="tiny" quaternary @click="toggleMode">
+            {{ isolated ? '改用兼容模式' : '回到隔离模式' }}
+          </n-button>
+        </n-space>
+      </n-alert>
+
       <!-- 插件未运行时，这里就是最直接的提示位（插件自己的视图也会再提示一次） -->
       <n-alert
         v-if="plugin && plugin.state !== 'running'"
@@ -118,35 +185,45 @@ watch(pluginId, () => {
         </template>
       </n-alert>
 
-      <!-- 3.2 新增：声明了入口但模块加载失败。
-           必须把原因和「怎么办」都写出来，否则用户只看到一个空白页。 -->
-      <n-alert v-else-if="loadError" type="error" title="插件前端加载失败">
-        <n-space vertical :size="10">
-          <n-text>{{ loadError }}</n-text>
-          <n-text depth="3" style="font-size: 12px">
-            入口地址：<code>{{ plugin?.frontend?.entry }}</code>
-            <template v-if="plugin?.frontend?.assets">
-              <br />资源基址：<code>{{ plugin.frontend.assets }}</code>
-            </template>
-            （加载失败时会自动尝试基址下的 <code>plugin.js</code> 兜底）
-          </n-text>
-          <n-space :size="8">
-            <n-button size="small" @click="retry">重试</n-button>
-            <n-button size="small" @click="load">刷新插件信息</n-button>
+      <!-- 声明了入口但隔离模式下的沙箱加载失败（3.2 起就有这条兜底，
+           3.3 把「加载失败」拆成沙箱内与沙箱外两种展示位置） -->
+      <template v-else-if="plugin && hasFrontend">
+        <n-alert v-if="!isolated && loadError" type="error" title="插件前端加载失败">
+          <n-space vertical :size="10">
+            <n-text>{{ loadError }}</n-text>
+            <n-text depth="3" style="font-size: 12px">
+              入口地址：<code>{{ plugin?.frontend?.entry }}</code>
+              <template v-if="plugin?.frontend?.assets">
+                <br />资源基址：<code>{{ plugin.frontend.assets }}</code>
+              </template>
+              （加载失败时会自动尝试基址下的 <code>plugin.js</code> 兜底）
+            </n-text>
+            <n-space :size="8">
+              <n-button size="small" @click="retry">重试</n-button>
+              <n-button size="small" @click="load">刷新插件信息</n-button>
+            </n-space>
           </n-space>
-        </n-space>
-      </n-alert>
+        </n-alert>
 
-      <!-- 正常挂载：把动态加载到的组件交给 Vue 渲染。
-           pluginId / plugin 两个 prop 是插件前端的契约。 -->
-      <component
-        :is="viewComponent"
-        v-else-if="viewComponent"
-        :key="viewKey"
-        :plugin-id="pluginId"
-        :plugin="plugin"
-        @error="loadError = $event"
-      />
+        <!-- 隔离模式：沙箱容器（内部自己处理加载中/失败/重试） -->
+        <PluginFrame
+          v-else-if="isolated"
+          :key="viewKey"
+          :plugin-id="pluginId"
+          :plugin="plugin"
+        />
+
+        <!-- 兼容模式：把动态加载到的组件交给 Vue 渲染。
+             pluginId / plugin 两个 prop 是插件前端的契约（两种模式一致）。 -->
+        <component
+          v-else-if="viewComponent"
+          :is="viewComponent"
+          :key="viewKey"
+          :plugin-id="pluginId"
+          :plugin="plugin"
+          @error="loadError = $event"
+        />
+      </template>
     </n-space>
     </n-spin>
   </AppLayout>

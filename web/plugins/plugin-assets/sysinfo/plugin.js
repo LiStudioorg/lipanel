@@ -182,6 +182,28 @@ function descriptions(items) {
   ]))
 }
 
+// ============ 桥接取数（隔离模式与兼容模式统一入口） ============
+//
+// 为什么要有这一层：3.3 起插件前端默认跑在 sandbox iframe 里，
+// 那里没有会话 Cookie，直接 fetch('/api/...') 会 401。
+// 宿主在 window.__LIPANEL__.api 上提供了「代发请求」的能力，
+// 本函数是对它的最小封装：把路径拼对、把状态码归一化。
+//
+// 插件作者应当始终用 apiGet/apiPost 取数，不要直接 fetch——
+// 后者只在兼容模式下能用，且会把自己绑死在"共享 Realm"这种不安全形态上。
+async function apiGet(path) {
+  const host = window.__LIPANEL__
+  if (!host || !host.api) {
+    throw new Error(
+      '插件运行环境不可用（window.__LIPANEL__.api 缺失）。' +
+        '请确认插件前端是按 3.3 的契约加载的。',
+    )
+  }
+  // 隔离模式下走 postMessage 桥；兼容模式下宿主也提供同样的 api 对象，
+  // 因此这里无需区分模式。
+  return host.api.get(path)
+}
+
 // ============ 组件本体 ============
 
 const SysinfoPluginView = {
@@ -196,32 +218,27 @@ const SysinfoPluginView = {
     const error = ref('')
     const payload = ref(null)
 
-    // 数据全部来自**插件自己的进程**：/api/plugins/<id>/info 由核心转发。
+    // 数据全部来自**插件自己的进程**：/info 由核心转发给插件进程处理。
     // 这条链路能跑通，就证明「核心 → 插件进程」是通的。
+    //
+    // ============ 隔离模式下的取数方式（阶段三 3.3） ============
+    //
+    // 下面这行 apiGet('/info') 在两种模式下都能工作：
+    //
+    //   隔离模式（默认）：本文件跑在 sandbox iframe 里（opaque origin），
+    //     没有会话 Cookie，fetch('/api/...') 会被后端 401。
+    //     因此 apiGet 会经 postMessage 请宿主代取，宿主拿到响应后回传。
+    //     插件里 **看不到也不接触任何凭据**。
+    //
+    //   兼容模式（?legacy=1）：本文件与宿主共享 Realm，
+    //     apiGet 退化为宿主提供的 fetch（行为与 3.2 完全一致）。
+    //
+    // 插件作者因此不需要为「跑在哪种模式」写分支——桥接层吸收了这个差异。
     async function load() {
       loading.value = true
       error.value = ''
       try {
-        const resp = await fetch(
-          '/api/plugins/' + encodeURIComponent(props.pluginId) + '/info',
-          { headers: { Accept: 'application/json' }, credentials: 'same-origin' },
-        )
-        const text = await resp.text()
-        let body = null
-        try {
-          body = text ? JSON.parse(text) : null
-        } catch {
-          body = null
-        }
-        if (!resp.ok) {
-          // 503 = 插件未运行。这不是错误而是可操作的状态，单独给指引。
-          error.value =
-            resp.status === 503
-              ? '插件当前未运行。请到「插件管理」页启动后再回到此页面。'
-              : body?.error || 'HTTP ' + resp.status
-          payload.value = null
-          return
-        }
+        const body = await apiGet('/info')
         if (!body) {
           error.value = '插件返回了非 JSON 内容'
           payload.value = null
@@ -230,7 +247,21 @@ const SysinfoPluginView = {
         payload.value = body
       } catch (err) {
         payload.value = null
-        error.value = '无法连接后端：' + (err?.message || err)
+        // 503 = 插件未运行。这不是错误而是可操作的状态，单独给指引。
+        // 状态码由桥接层挂在 error.status 上（见 bridge.js）。
+        if (err?.status === 503) {
+          error.value = '插件当前未运行。请到「插件管理」页启动后再回到此页面。'
+        } else if (err?.status === 403) {
+          // 权限不足：把「缺哪个权限」显示出来，用户才知道怎么修。
+          const need = err?.body?.required
+          error.value =
+            '插件权限不足：' + (err?.body?.error || err.message) +
+            (need ? '（需要权限 ' + need + '）' : '')
+        } else if (err?.status === 401) {
+          error.value = '登录已过期，请刷新页面重新登录。'
+        } else {
+          error.value = err?.message || '无法从插件获取数据'
+        }
       } finally {
         loading.value = false
       }
@@ -326,6 +357,98 @@ const SysinfoPluginView = {
       ])
     }
 
+    // ---------- 隔离效果演示（阶段三 3.3） ----------
+    //
+    // 这张卡片的目的是把「沙箱到底隔离了什么」变成**用户看得见的结论**，
+    // 而不是文档里的一句承诺。两个检测都是运行时实测：
+    //
+    //   1. 读 document.cookie —— 隔离模式下抛异常或为空；
+    //   2. 直连 fetch('/api/...') —— 隔离模式下没有会话 Cookie，被后端 401。
+    //
+    // 在兼容模式（?legacy=1）下两项会失败，卡片会明确标红——
+    // 这正好构成了两种模式的可视对照。
+    const isolation = ref(null)
+
+    function probeIsolation() {
+      const result = { sandboxed: Boolean(window.__LIPANEL__?.frame) }
+
+      // 1) cookie 可读性。
+      // 沙箱（opaque origin）下访问 document.cookie 要么抛 SecurityError，
+      // 要么返回空串——两种都说明「读不到宿主会话」。
+      try {
+        const c = document.cookie
+        result.cookieReadable = Boolean(c && c.length)
+        result.cookieDetail = c ? '读到了 ' + c.length + ' 字节' : '（空）'
+      } catch (err) {
+        result.cookieReadable = false
+        result.cookieDetail = '访问被浏览器拒绝：' + (err?.name || err)
+      }
+
+      // 2) 直连核心接口。
+      // 用 try/catch 包住：沙箱里 fetch 可能直接抛（CSP/origin 限制）。
+      return fetch('/api/system/info', {
+        headers: { Accept: 'application/json' },
+        credentials: 'same-origin',
+      })
+        .then((resp) => {
+          result.directStatus = resp.status
+          result.directBlocked = resp.status === 401
+        })
+        .catch((err) => {
+          result.directStatus = 0
+          result.directBlocked = true
+          result.directDetail = String(err?.message || err)
+        })
+        .then(() => {
+          result.done = true
+          isolation.value = result
+        })
+    }
+
+    onMounted(probeIsolation)
+
+    function isolationCard() {
+      const r = isolation.value
+      if (!r || !r.done) {
+        return card('隔离效果检测', null, [h('div', { style: S.muted }, '检测中…')])
+      }
+
+      const ok = r.cookieReadable === false && r.directBlocked === true
+      const tone = ok ? 'info' : 'warning'
+      const title = ok ? '✓ 沙箱隔离已生效' : '⚠ 未隔离（共享 Realm）'
+
+      const rows = [
+        h('div', { style: S.row }, [
+          h('span', { style: S.muted }, '运行环境：'),
+          h('code', null, r.sandboxed ? 'sandbox iframe（opaque origin）' : '宿主 Realm（兼容模式）'),
+        ]),
+        h('div', { style: S.row }, [
+          h('span', { style: S.muted }, '读取 document.cookie：'),
+          h('span', null,
+            r.cookieReadable
+              ? '✖ 可以读取（' + r.cookieDetail + '）—— 存在会话泄露风险'
+              : '✓ 读不到（' + r.cookieDetail + '）'),
+        ]),
+        h('div', { style: S.row }, [
+          h('span', { style: S.muted }, '直连 /api/system/info：'),
+          h('span', null,
+            r.directBlocked
+              ? '✓ 被拒绝（HTTP ' + r.directStatus + '）—— 拿不到核心数据'
+              : '✖ 成功（HTTP ' + r.directStatus + '）—— 插件可越权访问核心接口'),
+        ]),
+      ]
+
+      return alertBox(tone, title, h('div', { style: S.stack }, [
+        ...rows,
+        h('div', { style: { ...S.muted, marginTop: '4px' } },
+          ok
+            ? '以上两项检测为本页在浏览器里实测的结果。插件要数据时会通过 postMessage ' +
+              '请宿主代取，凭据始终留在宿主侧。'
+            : '当前为兼容模式：插件与宿主共享 Realm。若插件前端不完全可信，' +
+              '请去掉 URL 上的 legacy 参数回到隔离模式。'),
+      ]))
+    }
+
     return () => {
       const children = []
 
@@ -351,6 +474,7 @@ const SysinfoPluginView = {
             '：核心收到 /api/plugins/' + props.pluginId + '/info 后，经 Unix socket 转发给插件处理。' +
             '可与「系统概览」页的核心直连接口对比。'),
         )
+        children.push(isolationCard())
       }
 
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '16px' } }, children)

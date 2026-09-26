@@ -107,3 +107,85 @@ export function callPlugin(id, subPath, { timeout = 15000, ...init } = {}) {
   }
   return request(`/api/plugins/${encodeURIComponent(id)}/${clean}`, { timeout, ...init })
 }
+
+// ---------- 审计接口（阶段三 3.3） ----------
+
+// 获取全局审计记录。options 支持 { plugin, outcome, limit }。
+//
+// 审计页是排查工具：它自己必须尽量不失败。因此这里对参数做宽容处理
+// （后端也会回落默认值），失败时由调用方展示错误并保留上一次的数据。
+export function fetchAuditLog({ plugin = '', outcome = '', limit = 100 } = {}) {
+  const params = new URLSearchParams()
+  if (plugin) params.set('plugin', plugin)
+  if (outcome) params.set('outcome', outcome)
+  if (limit) params.set('limit', String(limit))
+  const query = params.toString()
+  return request(`/api/plugins/audit${query ? `?${query}` : ''}`)
+}
+
+// 获取单个插件的审计记录。
+export function fetchPluginAudit(id, { outcome = '', limit = 100 } = {}) {
+  const params = new URLSearchParams()
+  if (outcome) params.set('outcome', outcome)
+  if (limit) params.set('limit', String(limit))
+  const query = params.toString()
+  return request(`/api/plugins/${encodeURIComponent(id)}/audit${query ? `?${query}` : ''}`)
+}
+
+// 获取单个插件声明并已被核心接受的权限清单。
+export function fetchPluginPermissions(id) {
+  return request(`/api/plugins/${encodeURIComponent(id)}/permissions`)
+}
+
+// ---------- 沙箱桥接专用（阶段三 3.3） ----------
+
+// callPluginRaw 是给 sandbox iframe 桥用的「不抛异常」版本。
+//
+// 与 callPlugin 的区别（这个区别很关键）：
+//   · callPlugin 失败时 throw ApiError —— 适合宿主自己的代码（用 try/catch 处理）；
+//   · callPluginRaw 失败时返回 {status, body} —— 适合桥接，因为插件前端
+//     需要看到**状态码本身**（403 要展示缺失的权限、503 要提示先启动插件），
+//     而不是一个被统一成字符串的异常。
+//
+// 这里刻意不做任何路径校验：路径白名单由 bridge.js 的
+// buildPluginAPIPath 强制（安全边界必须在宿主侧、且只有一处）。
+// 本函数只负责「把请求发出去、把结果原样带回来」。
+export async function callPluginRaw(path, init = {}, externalSignal = null) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), PLUGIN_ACTION_TIMEOUT_MS)
+
+  // 桥可以在组件卸载时取消请求：把外部 signal 接进来。
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort()
+    else externalSignal.addEventListener('abort', () => controller.abort(), { once: true })
+  }
+
+  let resp
+  try {
+    resp = await fetch(path, {
+      headers: { Accept: 'application/json' },
+      credentials: 'same-origin',
+      ...init,
+      signal: controller.signal,
+    })
+  } catch (err) {
+    clearTimeout(timer)
+    const msg = err?.name === 'AbortError' ? '请求超时或已被取消' : `无法连接后端：${err.message}`
+    return { status: 0, body: { error: msg } }
+  } finally {
+    clearTimeout(timer)
+  }
+
+  const text = await resp.text()
+  let body = null
+  if (text) {
+    try {
+      body = JSON.parse(text)
+    } catch {
+      // 非 JSON 响应（例如反向代理返回的 HTML 错误页）：
+      // 截断后原样带回去，比丢掉更能帮助排查。
+      body = { error: text.slice(0, 300) }
+    }
+  }
+  return { status: resp.status, body }
+}

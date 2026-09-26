@@ -30,6 +30,15 @@ const routes = [
     meta: { title: '插件管理' },
   },
   {
+    // 插件操作审计页（阶段三 3.3）。
+    // 必须放在 "/plugins/:id" 之前：否则 "audit" 会被当成插件 ID
+    // 命中了通配路由，打开审计页会变成"插件 audit 不存在"。
+    path: '/plugins/audit',
+    name: 'plugin-audit',
+    component: () => import('@/views/PluginAuditView.vue'),
+    meta: { title: '插件审计' },
+  },
+  {
     // 插件前端挂载点：:id 由 PluginHostView 交给前端注册表解析。
     //
     // 用 :id 通配而不是给每个插件写一条静态路由，是为了让「新增插件」

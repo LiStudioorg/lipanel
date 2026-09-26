@@ -58,10 +58,18 @@ coverage.txt
 Thumbs.db
 desktop.ini
 
-# ---------- 插件前端的构建期同步副本 ----------
-# 每个内置插件的前端有两份来源（见 build.sh 第 2 步）：
-#   web/plugins/<id>/plugin.js                          入库：唯一的源码
-#   internal/plugin/builtin/<id>/frontend/plugin.js     不入库：由 build.sh 拷入，
-#                                                       供 go:embed 打进二进制
-# 只保留源码那份，避免同一份代码出现两个"真相"，改动时漏同步。
-internal/plugin/builtin/*/frontend/plugin.js
+# ---------- 插件前端的 embed 源 ----------
+# 每个内置插件的前端有两份：
+#   web/plugins/plugin-assets/<id>/plugin.js            源码：Vite 原样分发，
+#                                                       也是 GET /assets 提供的版本
+#   internal/plugin/builtin/<id>/frontend/plugin.js     go:embed 源：编译进二进制
+#
+# **两份都必须入库。** 早先这里把 frontend/plugin.js 排除了（由 build.sh 拷入），
+# 结果是 CI 上 45 个平台全部编译失败：
+#     internal/plugin/builtin/sysinfo/plugin.go:66:12:
+#     pattern frontend: no matching files found
+# 原因：go:embed 的路径是相对插件源码目录解析的（不能用 ../ 跨目录），
+# 它只能指向 internal/plugin/builtin/<id>/frontend；而 CI 只下载了
+# web/dist，该目录在干净的 checkout 里根本不存在——被 ignore 了。
+# 入库后 checkout 即可编译，无需在工作流里做额外同步。
+# 一致性由 build.sh 保证：它会把源码那份同步过来，并可在 CI 里做校验。

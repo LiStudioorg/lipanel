@@ -1,24 +1,57 @@
-# 构建产物
+# ============================================================
+# lipanel .gitignore
+# 目标：只跟踪源码与配置，忽略依赖、构建产物、本地环境与凭据。
+# ============================================================
+
+# ---------- 依赖 ----------
+node_modules/
+web/node_modules/
+# 本地 npm 缓存（沙箱/HOME 不可写时使用）
+web/.npm-cache/
+
+# ---------- 前端构建产物 ----------
+# 注意：不能写成 `web/dist/`（整目录忽略），否则 web/dist/.gitkeep 无法入库，
+# 会导致干净 clone 后 go:embed 报 "pattern all:web/dist: no matching files found"。
+# go:embed 要求目标目录必须非空，因此这里只忽略内容、保留占位文件。
+web/dist/*
+!web/dist/.gitkeep
+
+# ---------- Go 编译产物 ----------
+# 单二进制产物：build.sh 输出到 dist/panel，手动 go build 可能产出根目录 panel
+panel
 /dist/
 /bin/
 /lipanel
 *.exe
-
-# 前端
-web/node_modules/
-# 前端构建产物不入库，但保留占位文件（go:embed 需要目录非空）
-web/dist/*
-!web/dist/.gitkeep
-# 本地 npm 缓存（沙箱内 HOME 不可写时使用）
-web/.npm-cache/
-
-# 测试与覆盖率
 *.test
-*.out
-coverage.txt
 
-# 编辑器 / 系统
+# ---------- 环境变量与凭据（严禁入库） ----------
+.env
+.env.*
+# 例外必须写在最后：Git 按顺序匹配，最后命中的规则生效。
+!.env.example
+*.pem
+*.key
+*.crt
+.git-credentials
+
+# ---------- 运行时数据与日志 ----------
+*.log
+logs/
+data/
+tmp/
+coverage.txt
+*.out
+
+# ---------- 编辑器 / IDE ----------
 .idea/
 .vscode/
-.DS_Store
 *.swp
+*.swo
+*~
+
+# ---------- 操作系统 ----------
+.DS_Store
+._*
+Thumbs.db
+desktop.ini

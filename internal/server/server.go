@@ -17,6 +17,7 @@ import (
 
 	"lipanel/internal/auth"
 	"lipanel/internal/plugin"
+	"lipanel/internal/service"
 	"lipanel/internal/sysinfo"
 )
 
@@ -44,6 +45,13 @@ type Options struct {
 	// Plugins 提供插件管理能力；为 nil 时插件相关接口返回 503。
 	// 由 main 注入，测试可传入自定义实例（见 plugin_api_test.go）。
 	Plugins *plugin.Manager
+	// Services 提供 systemd 服务管理能力（阶段四 4.1）。
+	// 为 nil 时服务相关接口返回 503（与 Plugins 同样的降级策略）。
+	//
+	// 注意：即使注入了 Manager，系统本身没有 systemd 时
+	// 它也只会返回「不可用」而不是报错——降级判断在 service 包内，
+	// 这里不需要也不应该重复判断。
+	Services *service.Manager
 }
 
 // Server 封装 HTTP 服务及其依赖。
@@ -54,6 +62,7 @@ type Server struct {
 	sysinfo     *sysinfo.Collector
 	plugins     *plugin.Manager
 	pluginProxy *plugin.Proxy
+	serviceMgr  *service.Manager
 	handler     http.Handler
 	httpSrv     *http.Server
 }
@@ -94,9 +103,14 @@ func New(opts Options) (*Server, error) {
 		s.pluginProxy = plugin.NewProxy(opts.Plugins)
 	}
 
+	// 服务管理（阶段四 4.1）：同样只在 main 注入时启用。
+	// 未注入时 /api/services 返回 503，老测试无需改动即可继续通过。
+	s.serviceMgr = opts.Services
+
 	mux := http.NewServeMux()
 	s.registerAPIRoutes(mux)
 	s.registerPluginRoutes(mux)
+	s.registerServiceRoutes(mux)
 
 	staticHandler, err := s.staticHandler()
 	if err != nil {

@@ -31,6 +31,7 @@ import (
 	"lipanel/internal/config"
 	"lipanel/internal/plugin"
 	"lipanel/internal/server"
+	"lipanel/internal/service"
 )
 
 // distFS 承载 web/dist 下的全部前端产物。
@@ -101,6 +102,9 @@ func run() error {
 			"插件操作审计日志路径（JSONL，追加写入，权限 0600）；留空则审计只保留在内存中")
 		pluginAuditBuf = flag.Int("audit-buffer", plugin.DefaultAuditCapacity,
 			"插件操作审计在内存中保留的条数上限（供审计页查询）")
+
+		serviceTimeout = flag.Duration("service-timeout", service.DefaultCommandTimeout,
+			"单个服务启停操作中每次 systemctl 调用的超时（如 30s、2m）")
 	)
 	flag.Parse()
 
@@ -193,6 +197,45 @@ func run() error {
 		"audit_buffer", *pluginAuditBuf,
 	)
 
+	// 服务管理器（阶段四 4.1）。
+	//
+	// 审计采用「统一落盘、分别查询」：
+	//   · 落盘：与插件审计**共用同一个 -audit-log 文件**（JSONL 追加写），
+	//     一次 tail -f / 一套采集器即可覆盖面板的全部操作留痕；
+	//   · 查询：两者各有独立类型、独立环形缓冲与独立查询接口
+	//     （/api/services/audit 与 /api/plugins/audit），互不污染。
+	//
+	// 共用文件的并发安全性：两边都以 O_APPEND 打开，且每次写入都是
+	// 单次 write 系统调用（一行数百字节的 JSON + '\n'），
+	// 因此两条写入流不会互相截断或交错。
+	//
+	// 刻意**不**伪造一个 "core:systemd" 之类的插件 ID 来复用插件审计类型：
+	// 那会让插件审计页冒出一个根本不存在的「插件」，统计也随之失真。
+	serviceAuditor, err := service.NewAuditor(service.AuditOptions{
+		Capacity: *pluginAuditBuf,
+		Path:     *pluginAuditLog,
+		Logger:   logger,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = serviceAuditor.Close() }()
+
+	serviceManager, err := service.NewManager(service.Options{
+		Logger:         logger,
+		CommandTimeout: *serviceTimeout,
+		Auditor:        serviceAuditor,
+	})
+	if err != nil {
+		return err
+	}
+	// 无 systemd 时只告警不阻断：面板其它功能必须照常可用
+	// （计划要求：无 systemd 时优雅降级并提示）。
+	if !serviceManager.Available() {
+		logger.Warn("服务管理不可用，面板其它功能不受影响",
+			"reason", serviceManager.UnavailableReason())
+	}
+
 	// 注入内嵌前端资源（go:embed 在根目录，见本文件顶部 distFS）。
 	// 仅在没有用 -static-dir 覆盖时才需要解析；解析失败属构建错误，直接终止。
 	var (
@@ -216,6 +259,7 @@ func run() error {
 		WebBuilt:  embeddedBuilt,
 		Auth:      authenticator,
 		Plugins:   pluginManager,
+		Services:  serviceManager,
 	})
 	if err != nil {
 		return err

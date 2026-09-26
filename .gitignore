@@ -1,0 +1,20 @@
+# 构建产物
+/dist/
+/bin/
+/lipanel
+*.exe
+
+# 前端
+web/node_modules/
+web/dist/
+
+# 测试与覆盖率
+*.test
+*.out
+coverage.txt
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+*.swp

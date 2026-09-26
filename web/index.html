@@ -4,6 +4,35 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>lipanel</title>
+
+    <!--
+      插件前端的依赖解析（import map）。
+
+      背景：插件前端是插件自带的 ESM 模块，它在浏览器里 `import 'vue'` 时
+      需要知道 "vue" 这个裸说明符指向哪份实现。这里指向宿主正在使用的
+      同一份 Vue —— 插件与宿主共享单例，ref/render 才是同一套响应式系统。
+      若各加载各的 Vue，会出现「数据变了视图不动」这类极难定位的问题。
+
+      /assets/vue.js 是 Vite 用固定路径产出的独立入口（见 vite.config.js 的
+      rollupOptions.input 与 entryFileNames），源码是 src/runtime.js：
+      它只做一件事，就是把宿主那份 Vue 实例挂到 window.__LIPANEL__ 上。
+      同一个 'vue' 在 Rollup 里只有一个模块实例，因此 runtime.js 与主
+      应用 import 到的是同一个 Vue（共享 chunk runtime-dom.esm-bundler-*.js）。
+
+      入口规范：插件只允许依赖 "vue"。Naive UI 需要 <n-config-provider>
+      上下文，而插件前端是以非 .vue 源码原样加载的，无法使用
+      （详见 web/plugins/plugin-assets/README.md）。
+
+      本 import map 也是 loader.js 的 Blob 降级路径能工作的前提：
+      Blob 模块没有自己的目录结构，裸说明符只能靠它解析。
+    -->
+    <script type="importmap">
+      {
+        "imports": {
+          "vue": "/assets/vue.js"
+        }
+      }
+    </script>
   </head>
   <body>
     <div id="app"></div>

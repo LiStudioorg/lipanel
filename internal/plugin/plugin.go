@@ -70,25 +70,52 @@ var ErrAlreadyRunning = errors.New("plugin: 插件已在运行中")
 // ErrUnsupported 表示插件不支持该操作（例如 external 模式无法由核心停止）。
 var ErrUnsupported = errors.New("plugin: 该插件不支持此操作")
 
-// Frontend 描述插件的前端挂载信息，是「为后续动态挂载插件前端留的插槽」。
+// Frontend 描述插件的前端挂载信息，是「插件前端动态挂载」的契约。
 //
-// 本阶段核心只把这份元数据原样透传给前端，由前端静态注册表
-// （web/src/plugins/registry.js）决定用什么组件渲染；
-// 后续阶段可把 Entry 换成真正的远端 ESM 入口做动态加载，
-// 而无需改动路由与菜单逻辑。
+// 阶段三 3.1 里 Entry 只是前端静态注册表（web/src/plugins/registry.js）
+// 的查表 key；3.2 起它的语义升级为**插件自带的 ESM 模块地址**，
+// 由前端动态 import() 加载，因此新增插件不再需要改动主程序源码。
+//
+// 约定（与 web/plugins/plugin-assets/README.md 一致）：
+//
+//	Entry     "/plugin-assets/sysinfo/plugin.js"  前端入口（ESM 默认导出组件）
+//	Assets    "/plugin-assets/sysinfo/"           资源基址：相对入口的基准，
+//	                                              也是加载失败时的兜底目录
+//	Type      "esm"                               入口类型，缺省即 esm
+//
+// Entry 支持三种形态：相对路径（相对 Assets）、站点绝对路径（推荐）、
+// http(s) 远端地址（前端默认禁用，属安全策略）。
 type Frontend struct {
-	// Entry 是前端入口标识。当前约定为静态注册表的 key，
-	// 后续可演进为 ESM 模块 URL。
+	// Entry 是前端入口地址（ESM 模块）。
+	// 为空表示该插件没有前端界面，前端会显示「该插件未提供前端界面」。
 	Entry string `json:"entry"`
+	// Assets 是插件前端资源的基址（以 / 结尾，站点绝对路径）。
+	// 两个用途：解析相对 Entry；Entry 加载失败时尝试 <Assets>plugin.js。
+	Assets string `json:"assets,omitempty"`
+	// Type 是入口类型。目前只支持 "esm"（缺省值），
+	// 保留该字段是为了将来能加 "umd" 等形态而不破坏旧前端。
+	Type string `json:"type,omitempty"`
 	// NavTitle 是菜单中显示的名称；为空表示该插件不需要出现在菜单里。
 	NavTitle string `json:"nav_title,omitempty"`
 	// NavIcon 是菜单图标标识（前端自行映射到具体图标组件）。
 	NavIcon string `json:"nav_icon,omitempty"`
 }
 
+// FrontendTypeESM 是 Frontend.Type 的缺省与唯一受支持取值。
+const FrontendTypeESM = "esm"
+
 // Valid 判断前端挂载信息是否可用于渲染菜单。
+//
+// 只有「声明了入口 + 声明了菜单标题」的插件才会进菜单：
+// 没有入口的插件点了必然空页，没有标题则菜单项无从命名。
 func (f Frontend) Valid() bool {
 	return strings.TrimSpace(f.Entry) != "" && strings.TrimSpace(f.NavTitle) != ""
+}
+
+// ESMEntry 返回入口类型是否可用（缺省视为 esm）。
+func (f Frontend) ESMEntry() bool {
+	t := strings.TrimSpace(f.Type)
+	return t == "" || t == FrontendTypeESM
 }
 
 // Descriptor 是插件的静态元数据，用于注册与展示。

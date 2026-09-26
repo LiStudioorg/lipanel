@@ -18,7 +18,7 @@ import {
   startPlugin,
   stopPlugin,
 } from '@/api/plugins'
-import { hasPluginView, resolveNavIcon } from '@/plugins/registry'
+import { applyPlugins, hasPluginView, resolveNavIcon } from '@/plugins/registry'
 import { formatDuration, formatTime } from '@/utils/format'
 import AppLayout from '@/layouts/AppLayout.vue'
 
@@ -56,6 +56,8 @@ async function load({ silent = false } = {}) {
     const data = await fetchPlugins()
     plugins.value = data.plugins || []
     socketDir.value = data.socket_dir || ''
+    // 登记前端入口：下面 hasPluginView(p.id) 的同步判定依赖它。
+    applyPlugins(plugins.value)
   } catch (err) {
     if (err instanceof ApiError && err.isUnauthorized) {
       authStore.clear()
@@ -224,7 +226,7 @@ const summary = computed(() => `共 ${plugins.value.length} 个插件，${runnin
             <!-- 打开插件页面：只有「运行中 + 前端有实现」才可点 -->
             <n-button
               size="small"
-              :disabled="p.state !== 'running' || !hasPluginView(p.frontend?.entry)"
+              :disabled="p.state !== 'running' || !hasPluginView(p.id)"
               @click="openPlugin(p)"
             >
               打开
@@ -299,8 +301,8 @@ const summary = computed(() => `共 ${plugins.value.length} 个插件，${runnin
             <!-- 前端插槽状态：让「插件有没有界面」一目了然 -->
             <n-text depth="3" style="font-size: 12px">
               前端入口：<code>{{ p.frontend?.entry || '（未声明）' }}</code>
-              <template v-if="p.frontend?.entry && !hasPluginView(p.frontend.entry)">
-                —— 前端尚未提供该插件的界面
+              <template v-if="!p.frontend?.entry">
+                —— 该插件未提供前端界面
               </template>
             </n-text>
           </n-space>

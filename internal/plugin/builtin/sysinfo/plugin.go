@@ -8,13 +8,25 @@
 //
 //  1. 实现 plugin.Handler 接口（Descriptor + Routes）；
 //  2. 在本包的 init 中调用 plugin.RegisterBuiltin 注册工厂函数；
-//  3. 前端如需界面，在 web/src/plugins/registry.js 里登记同名的 entry。
+//  3. 前端如需界面，写一个自带的 ESM 模块（web/plugins/plugin-assets/<id>/plugin.js），
+//     并在 Descriptor().Frontend 里声明它的地址 —— 主程序无需任何改动。
+//
+// 步骤 3 是阶段三 3.2 的关键变化：3.1 时前端界面必须登记在
+// web/src/plugins/registry.js 的静态表里（等于必须改主程序源码），
+// 现在插件前端与插件后端一样是**自包含**的：
+//
+//	web/plugins/plugin-assets/sysinfo/plugin.js  ──（Vite publicDir 原样拷贝）──▶
+//	web/dist/plugin-assets/sysinfo/plugin.js ──（go:embed）──▶
+//	GET /api/plugins/sysinfo/assets/plugin.js ──（前端 loader.js）──▶
+//	动态 import 并挂到 /plugins/sysinfo 路由
 //
 // 注意：插件进程是独立进程，不共享核心的内存状态，
 // 因此它自己持有一个 sysinfo.Collector（CPU 使用率需要两次快照差值）。
 package sysinfo
 
 import (
+	"embed"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -30,7 +42,29 @@ import (
 const ID = "sysinfo"
 
 // Version 是插件版本号，独立于主程序版本演进。
-const Version = "0.1.0"
+const Version = "0.2.0"
+
+// 插件自带前端的地址（相对核心的固定前缀）。
+//
+// /plugin-assets/<id>/ 由前端 loader.js 与插件骨架共同约定：核心把它
+// 转发到插件的 GET /assets/ 上。写绝对路径而不是相对路径，是为了让
+// 前端能直接原生 import（相对路径在动态 import 下必须靠 Blob 降级，
+// 见 web/src/plugins/loader.js 的说明）。
+const (
+	frontendEntry  = "/plugin-assets/" + ID + "/plugin.js"
+	frontendAssets = "/plugin-assets/" + ID + "/"
+)
+
+// frontendFS 承载插件自带的前端代码。
+//
+// 为什么用 go:embed 而不是运行时读 web/dist/plugin-assets 目录：
+// 工程约束是「单二进制、scp 到服务器直接跑」。插件前端在构建时
+// （Vite publicDir → web/dist/plugin-assets）已经和主程序进了同一个
+// 可执行文件；若运行时再去读磁盘目录，部署就退化成必须同时拷贝
+// dist/plugin-assets，单文件部署直接失效。
+//
+//go:embed frontend
+var frontendFS embed.FS
 
 // init 把本插件登记到内置插件注册表。
 //
@@ -40,6 +74,18 @@ func init() {
 	plugin.RegisterBuiltin(ID, func(logger *slog.Logger) plugin.Handler {
 		return New(logger)
 	})
+}
+
+// Assets 实现 plugin.AssetProvider：把自带的前端资源交给插件骨架，
+// 由骨架统一通过 GET /assets/* 提供（含路径穿越防护与 MIME 处理）。
+func (p *Plugin) Assets() fs.FS {
+	sub, err := fs.Sub(frontendFS, "frontend")
+	if err != nil {
+		// frontend 目录由 go:embed 保证存在，取不到属编程错误。
+		p.logger.Error("插件前端资源不可用", "plugin", ID, "err", err)
+		return nil
+	}
+	return sub
 }
 
 // Plugin 实现 plugin.Handler 接口。
@@ -64,19 +110,25 @@ func New(logger *slog.Logger) *Plugin {
 
 // Descriptor 返回插件元数据。
 //
-// Frontend 字段是「插件前端挂载插槽」的元数据：
-// 核心会把它原样返回给前端，前端据此生成菜单项并决定渲染哪个组件。
+// Frontend 字段是「插件前端动态挂载」的契约：核心把它原样返回给前端，
+// 前端据此生成菜单项并动态 import 插件自带的 ESM 入口。
 func (p *Plugin) Descriptor() plugin.Descriptor {
 	return plugin.Descriptor{
 		ID:          ID,
 		Name:        "系统信息（插件版）",
 		Version:     Version,
-		Description: "通过独立插件进程采集 CPU / 内存 / 磁盘信息，用于验证插件通讯链路。",
+		Description: "通过独立插件进程采集 CPU / 内存 / 磁盘信息，用于验证插件通讯链路与前端动态挂载。",
 		Builtin:     true,
 		Mode:        plugin.ModeManaged,
 		Frontend: plugin.Frontend{
-			// Entry 是前端静态注册表（web/src/plugins/registry.js）的 key。
-			Entry:    ID,
+			// Entry 是插件自带前端的 ESM 入口地址。
+			// 核心会把它转发到本插件的 GET /assets/plugin.js。
+			Entry: frontendEntry,
+			// Assets 是资源基址：相对入口的解析基准，
+			// 也是前端加载失败时的兜底目录（<Assets>plugin.js）。
+			Assets: frontendAssets,
+			// Type 显式写出来，便于插件作者照抄；缺省值同样是 esm。
+			Type:     plugin.FrontendTypeESM,
 			NavTitle: "系统信息（插件）",
 			NavIcon:  "dashboard",
 		},
@@ -117,15 +169,15 @@ func (p *Plugin) handleEcho(w http.ResponseWriter, r *http.Request) {
 	}
 
 	plugin.PluginJSON(w, p.logger, http.StatusOK, map[string]any{
-		"plugin":     ID,
-		"method":     r.Method,
-		"path":       r.URL.Path,
-		"query":      r.URL.RawQuery,
-		"headers":    headers,
-		"remote":     r.RemoteAddr,
+		"plugin":      ID,
+		"method":      r.Method,
+		"path":        r.URL.Path,
+		"query":       r.URL.RawQuery,
+		"headers":     headers,
+		"remote":      r.RemoteAddr,
 		"received_at": time.Now().Format(time.RFC3339),
 		// 显式汇报凭据头是否为空，方便用一条 curl 就验证核心侧的剥离逻辑。
-		"cookie_stripped":      r.Header.Get("Cookie") == "",
+		"cookie_stripped":        r.Header.Get("Cookie") == "",
 		"authorization_stripped": r.Header.Get("Authorization") == "",
 	})
 }

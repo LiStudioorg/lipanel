@@ -29,7 +29,36 @@ cd ..
 
 [ -f web/dist/index.html ] || die "web/dist/index.html 不存在，前端构建未产出预期文件"
 
-# ---------- 2. 后端静态编译 ----------
+# ---------- 2. 同步插件自带前端 ----------
+#
+# 每个内置插件的前端有两份来源：
+#   源    web/plugins/plugin-assets/<id>/plugin.js          （入库，原样分发）
+#   → Vite publicDir 原样拷贝到 web/dist/plugin-assets/<id>/plugin.js
+#   → 再同步到 internal/plugin/builtin/<id>/frontend/plugin.js（go:embed 源，不入库）
+#
+# 两份内容必须一致：前者是插件进程经 GET /assets 提供的版本，后者是编译进
+# 二进制、随核心分发的版本。若不同步，就会出现「dev 下正常、单二进制里是
+# 旧版」这种最难排查的偏差。
+#
+# 为什么 go:embed 不能直接指向 web/dist/plugin-assets：
+#   go:embed 不能跨目录（不能用 ../），而这些代码位于 internal/ 下。
+# 因此用本步骤做一次显式拷贝；缺失时直接失败，而不是产出「没有前端」的二进制。
+log "同步插件自带前端 (plugin-assets → internal/.../frontend)"
+synced=0
+for src in web/plugins/plugin-assets/*/; do
+  [ -d "${src}" ] || continue
+  id="$(basename "${src}")"
+  [ -f "${src}plugin.js" ] || continue
+  dest="internal/plugin/builtin/${id}/frontend"
+  [ -d "${dest}" ] || die "插件 ${id} 有前端源码 (${src}plugin.js)，但 ${dest} 目录不存在"
+  mkdir -p "${dest}"
+  cp -f "${src}plugin.js" "${dest}/plugin.js"
+  synced=$((synced + 1))
+done
+[ "${synced}" -gt 0 ] || die "未同步到任何插件前端（web/plugins/plugin-assets/*/plugin.js 不存在？）"
+log "已同步 ${synced} 个插件前端"
+
+# ---------- 3. 后端静态编译 ----------
 log "编译后端 (CGO_ENABLED=0, version=${VERSION})"
 mkdir -p "${OUT_DIR}"
 CGO_ENABLED=0 go build \
@@ -38,7 +67,7 @@ CGO_ENABLED=0 go build \
   -o "${OUT_BIN}" \
   ./cmd/lipanel || die "后端编译失败"
 
-# ---------- 3. 校验产物 ----------
+# ---------- 4. 校验产物 ----------
 log "构建完成: ${OUT_BIN} ($(du -h "${OUT_BIN}" | cut -f1))"
 if command -v file >/dev/null 2>&1; then
   file "${OUT_BIN}"

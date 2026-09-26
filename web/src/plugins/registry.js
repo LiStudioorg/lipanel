@@ -1,48 +1,59 @@
-// 插件前端注册表 —— 「为后续动态挂载插件前端留的插槽」。
+// 插件前端注册表 —— 阶段三 3.2 起由「静态查表」改为「动态挂载」。
 //
-// 设计意图（重要，后续阶段会在这里扩展）：
+// 3.1 的做法是：插件在 frontend.entry 里声明一个字符串 key，前端在本文件
+// 的 pluginViews 静态表里查对应的组件。它有两个根本限制：
 //
-//   核心通过 GET /api/plugins 返回每个插件的 Frontend 元数据：
-//       { entry: "sysinfo", nav_title: "系统信息（插件）", nav_icon: "dashboard" }
-//   前端用 entry 作为 key 到本注册表中查找要渲染的组件。
+//   1. **新增插件必须改主程序源码**（往表里加一行）——插件就不再是自包含的；
+//   2. 插件的界面被编译进主包，用户自己写的插件**永远不可能**加进来。
 //
-// 本阶段（3.1）注册表是**静态**的：只有内置插件会在这里登记组件，
-// 组件通过 () => import(...) 懒加载（Vite 会把它拆成独立 chunk）。
+// 3.2 把 Entry 的语义升级为「插件自带 ESM 模块的地址」，由 loader.js
+// 动态 import 进来。于是：
 //
-// 后续阶段要做「外部插件动态挂载」时，只需要改动本文件的 resolvePluginView：
-// 把静态查表换成读取插件声明的 ESM 入口，例如
+//   后端（plugin.Frontend）                前端（本文件 + loader.js）
+//   entry:  "/plugin-assets/x/plugin.js"  ──import()──▶  { component }
+//   assets: "/plugin-assets/x/"           （加载失败时的兜底位置 plugin.js）
+//   type:   "esm"
 //
-//   defineAsyncComponent(() => import(/* @vite-ignore */ plugin.frontend.entry))
+// 本文件只保留「注册表」该有的三件事：登记入口、同步判定、解析组件。
+// 真正的加载细节（URL 解析、Blob 降级、契约校验）全在 loader.js 里。
 //
-// 路由（/plugins/:id）与菜单渲染**完全不需要改动**——
-// 这正是把「入口标识」与「渲染方式」解耦的价值。
-import { defineAsyncComponent } from 'vue'
+// 宿主页（PluginHostView）与布局（AppLayout）**不需要知道任何具体插件**：
+// 它们只做 hasPluginView(id) / resolvePluginView(id)，因此新增插件时
+// 这两个文件一行都不用改——这正是把「入口标识」与「渲染方式」解耦的价值。
+//
+// 注意：这里的判定一律是**同步**的（只看清单里有没有登记入口），
+// 因此在 onMounted 之前、在模板渲染期调用都是安全的。
+export {
+  applyPlugins,
+  clearPluginView,
+  clearViewCache,
+  getPluginLoadError,
+  listEntryIds,
+} from '@/plugins/loader'
 
-// pluginViews 是 entry -> 组件的映射。
+import {
+  hasEntry,
+  listEntryIds,
+  resolvePluginView as loadPluginView,
+} from '@/plugins/loader'
+
+// resolvePluginView 按插件 ID 解析前端组件。
 //
-// key 必须与插件 Descriptor.Frontend.Entry 一致（后端在
-// internal/plugin/builtin/sysinfo/plugin.go 中声明为 "sysinfo"）。
-const pluginViews = {
-  sysinfo: defineAsyncComponent(() => import('@/plugins/views/SysinfoPluginView.vue')),
+// 返回 null 表示该插件**没有声明前端入口**——调用方应展示
+// 「该插件未提供前端界面」。声明了入口但加载失败的情况，
+// 由 loader 的 onError 记录原因，调用方用 getPluginLoadError(id) 取详情。
+export function resolvePluginView(id) {
+  return loadPluginView(id)
 }
 
-// resolvePluginView 按 entry 解析插件前端组件。
-// 返回 null 表示当前没有该插件的前端实现——
-// 调用方应展示「该插件未提供前端界面」而不是渲染空白页。
-export function resolvePluginView(entry) {
-  if (!entry) return null
-  return pluginViews[entry] || null
+// hasPluginView 判断某个插件是否有前端界面（同步，供菜单与按钮使用）。
+export function hasPluginView(id) {
+  return hasEntry(id)
 }
 
-// hasPluginView 判断某个 entry 是否有前端实现。
-// 插件管理页用它来决定「打开」按钮是否可点。
-export function hasPluginView(entry) {
-  return Boolean(entry && pluginViews[entry])
-}
-
-// registeredEntries 返回已注册的 entry 列表，便于调试。
+// registeredEntries 返回已登记的插件 ID 列表，便于调试与排查。
 export function registeredEntries() {
-  return Object.keys(pluginViews)
+  return listEntryIds()
 }
 
 // NavIcon 映射表：把后端给的 nav_icon 字符串转成图标组件名。

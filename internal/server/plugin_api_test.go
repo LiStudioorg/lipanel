@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"lipanel/internal/plugin"
+	// 匿名导入内置插件，用于校验前端入口前缀约定。
+	_ "lipanel/internal/plugin/builtin/sysinfo"
 )
 
 // newPluginTestServer 构造一个注入了插件管理器的测试 Server。
@@ -314,5 +316,128 @@ func assertJSONContentType(t *testing.T, rec *httptest.ResponseRecorder) {
 	}
 	if strings.Contains(rec.Body.String(), "<!doctype html>") {
 		t.Errorf("响应体是前端 HTML，说明落到了 SPA 兜底: %s", rec.Body.String())
+	}
+}
+
+// ---------- 阶段三 3.2：插件前端资源的转发路径 ----------
+//
+// 前端加载插件前端时的实际链路是：
+//
+//	import "/plugin-assets/sysinfo/plugin.js"      （前端写死的约定前缀）
+//	  → fetch "/api/plugins/sysinfo/assets/plugin.js"（经核心）
+//	  → 转发到插件进程的 GET /assets/plugin.js
+//
+// 这里锁定路由层：请求必须走「转发兜底」路由并落到插件上，
+// 不能被 /api/plugins/{id} 之类的精确路由吞掉（那样会拿到元数据 JSON
+// 而不是插件代码，表现为插件页白屏，且日志里什么都看不到）。
+
+// 插件未运行时请求前端资源：必须是 503（可操作的提示），
+// 而不是 404——404 会让前端以为"插件没有前端"。
+func TestPluginAssetsReturns503WhenStopped(t *testing.T) {
+	s := newPluginTestServer(t)
+	cookie := loginCookie(t, s)
+
+	rec := doJSON(t, s, http.MethodGet, "/api/plugins/extplug/assets/plugin.js", nil, cookie)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("状态码 = %d, 期望 503, body=%s", rec.Code, rec.Body.String())
+	}
+	assertJSONContentType(t, rec)
+}
+
+// 前端资源路径必须走完整鉴权：未登录一律 401。
+//
+// 插件前端代码本身不是机密，但它揭示插件的内部实现，
+// 且该前缀经核心转发，绝不能成为绕过鉴权的口子。
+func TestPluginAssetsRequiresAuth(t *testing.T) {
+	s := newPluginTestServer(t)
+
+	for _, path := range []string{
+		"/api/plugins/extplug/assets/plugin.js",
+		"/api/plugins/extplug/assets/",
+	} {
+		rec := doJSON(t, s, http.MethodGet, path, nil)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("GET %s 未登录状态码 = %d, 期望 401", path, rec.Code)
+		}
+		assertJSONContentType(t, rec)
+	}
+}
+
+// 子路径裁剪必须把 assets 前缀完整交给插件。
+//
+// 插件侧注册的是 "GET /assets/"，若核心把路径裁成 "/plugin.js"
+// 或 "/assetsplugin.js"，插件就会 404，而核心侧看不出任何异常。
+func TestPluginAssetsSubPathTrimming(t *testing.T) {
+	tests := []struct {
+		name     string
+		fullPath string
+		id       string
+		want     string
+	}{
+		{"插件前端入口", "/api/plugins/sysinfo/assets/plugin.js", "sysinfo", "/assets/plugin.js"},
+		{"嵌套资源", "/api/plugins/sysinfo/assets/img/logo.png", "sysinfo", "/assets/img/logo.png"},
+		{"基址本身", "/api/plugins/sysinfo/assets/", "sysinfo", "/assets/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := pluginSubPath(tt.fullPath, tt.id)
+			if !ok {
+				t.Fatalf("pluginSubPath(%q, %q) 未识别为子路径", tt.fullPath, tt.id)
+			}
+			if got != tt.want {
+				t.Errorf("subPath = %q, 期望 %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// 插件声明的前端入口地址必须与核心的转发前缀对得上。
+//
+// 这是动态挂载里最容易"各自都对、合起来不通"的地方：
+// 插件写 /plugin-assets/<id>/plugin.js，核心转发 /api/plugins/<id>/assets/*，
+// 两者靠 frontend.assets 的位置约定关联。此断言把该约定钉死。
+func TestPluginFrontendAssetsPrefixContract(t *testing.T) {
+	const (
+		wantPrefix = "/plugin-assets/"
+		wantSuffix = "plugin.js"
+	)
+
+	s := newPluginTestServer(t)
+	cookie := loginCookie(t, s)
+	rec := doJSON(t, s, http.MethodGet, "/api/plugins", nil, cookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", rec.Code)
+	}
+
+	// 测试 Server 里的 extplug 是外部插件，未声明 assets；
+	// 这里只需确认字段被完整透传（空值也是有效信息）。
+	var got pluginListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+	if len(got.Plugins) == 0 {
+		t.Fatal("插件列表为空")
+	}
+
+	// 反向校验：真正声明了前端的内置插件（sysinfo）必须符合前缀约定。
+	// 通过 plugin 包的内置注册表读取，避免测试里硬编码插件实现。
+	for _, id := range plugin.BuiltinIDs() {
+		h, err := plugin.Build(id, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatalf("构造内置插件 %s 失败: %v", id, err)
+		}
+		fe := h.Descriptor().Frontend
+		if !fe.Valid() {
+			continue // 没有前端的插件不参与本约定
+		}
+		if !strings.HasPrefix(fe.Entry, wantPrefix+id+"/") {
+			t.Errorf("插件 %s 的 Entry = %q, 期望以 %q 开头", id, fe.Entry, wantPrefix+id+"/")
+		}
+		if !strings.HasSuffix(fe.Entry, wantSuffix) {
+			t.Errorf("插件 %s 的 Entry = %q, 期望以 %q 结尾", id, fe.Entry, wantSuffix)
+		}
+		if fe.Assets != wantPrefix+id+"/" {
+			t.Errorf("插件 %s 的 Assets = %q, 期望 %q", id, fe.Assets, wantPrefix+id+"/")
+		}
 	}
 }

@@ -6,14 +6,18 @@
 //
 // 菜单是「插件前端挂载插槽」的一部分：
 // builtinMenus 是核心功能，pluginMenus 由 /api/plugins 返回的
-// Frontend 元数据动态生成——新增一个内置插件，菜单里就自动多一项，
-// 不需要改动本文件。
+// Frontend 元数据动态生成——新增一个插件，菜单里就自动多一项，
+// 本文件一行都不用改。
+//
+// 阶段三 3.2 起菜单项的判定不再是「静态表里有没有登记」，
+// 而是「插件有没有声明 frontend.entry」：判定是同步的（不触发加载），
+// 因此菜单渲染不会被插件前端的网络请求拖慢。
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { authStore } from '@/stores/auth'
 import { ApiError } from '@/api/client'
 import { fetchPlugins } from '@/api/plugins'
-import { hasPluginView, resolveNavIcon } from '@/plugins/registry'
+import { applyPlugins, hasPluginView, resolveNavIcon } from '@/plugins/registry'
 
 const route = useRoute()
 const router = useRouter()
@@ -33,14 +37,13 @@ const builtinMenus = [
   { key: 'plugins', label: '插件管理', icon: '🧩', to: { name: 'plugin-list' } },
 ]
 
-// pluginMenus 把「已运行 + 声明了前端入口 + 前端确实有实现」的插件
-// 转成菜单项。
+// pluginMenus 把「已运行 + 声明了前端入口」的插件转成菜单项。
 //
 // 只有 running 的插件才进菜单：插件没跑起来时点进去必然 503，
 // 那是很差的体验；管理页才是启动插件的地方。
 const pluginMenus = computed(() =>
   plugins.value
-    .filter((p) => p.state === 'running' && p.frontend?.nav_title && hasPluginView(p.frontend?.entry))
+    .filter((p) => p.state === 'running' && p.frontend?.nav_title && hasPluginView(p.id))
     .map((p) => ({
       key: `plugin-${p.id}`,
       label: p.frontend.nav_title,
@@ -67,6 +70,8 @@ async function loadPlugins() {
   try {
     const data = await fetchPlugins()
     plugins.value = data.plugins || []
+    // 把后端元数据登记进前端注册表：菜单项的同步判定依赖它。
+    applyPlugins(plugins.value)
     pluginMenuError.value = ''
   } catch (err) {
     plugins.value = []

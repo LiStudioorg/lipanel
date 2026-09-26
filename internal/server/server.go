@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"lipanel/internal/auth"
+	"lipanel/internal/plugin"
 	"lipanel/internal/sysinfo"
 )
 
@@ -30,16 +31,21 @@ type Options struct {
 	StaticDir string
 	// Auth 提供登录鉴权能力；为 nil 时使用 New 内部的默认实现（见 buildAuth）。
 	Auth *auth.Authenticator
+	// Plugins 提供插件管理能力；为 nil 时插件相关接口返回 503。
+	// 由 main 注入，测试可传入自定义实例（见 plugin_api_test.go）。
+	Plugins *plugin.Manager
 }
 
 // Server 封装 HTTP 服务及其依赖。
 type Server struct {
-	opts    Options
-	logger  *slog.Logger
-	auth    *auth.Authenticator
-	sysinfo *sysinfo.Collector
-	handler http.Handler
-	httpSrv *http.Server
+	opts        Options
+	logger      *slog.Logger
+	auth        *auth.Authenticator
+	sysinfo     *sysinfo.Collector
+	plugins     *plugin.Manager
+	pluginProxy *plugin.Proxy
+	handler     http.Handler
+	httpSrv     *http.Server
 }
 
 // New 根据 opts 构建 Server。返回错误说明配置非法，调用方应据此终止启动。
@@ -70,8 +76,17 @@ func New(opts Options) (*Server, error) {
 	}
 	s.sysinfo = sysinfo.NewCollector()
 
+	// 插件系统：仅在 main 注入 Manager 时启用。
+	// 未注入时相关接口返回 503（而不是 panic），
+	// 这样只关心系统信息的旧测试仍能构造最小 Server。
+	if opts.Plugins != nil {
+		s.plugins = opts.Plugins
+		s.pluginProxy = plugin.NewProxy(opts.Plugins)
+	}
+
 	mux := http.NewServeMux()
 	s.registerAPIRoutes(mux)
+	s.registerPluginRoutes(mux)
 
 	staticHandler, err := s.staticHandler()
 	if err != nil {

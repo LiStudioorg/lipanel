@@ -18,6 +18,7 @@ import (
 
 	"lipanel/internal/auth"
 	"lipanel/internal/config"
+	"lipanel/internal/plugin"
 	"lipanel/internal/server"
 )
 
@@ -33,6 +34,13 @@ func main() {
 }
 
 func run() error {
+	// 插件模式必须在 flag.Parse 之前判断：
+	// flag 包遇到 "__plugin_sysinfo" 这类非 - 开头的参数会直接报错退出，
+	// 而该参数正是核心拉起插件进程时传入的。
+	if handled, err := maybeRunAsPlugin(); handled {
+		return err
+	}
+
 	var (
 		configPath = flag.String("config", "", "配置文件路径（JSON）。指定后首次启动会自动生成密码哈希与签名密钥并落盘")
 		addr       = flag.String("addr", config.DefaultAddr, "HTTP 监听地址（覆盖配置文件）")
@@ -49,6 +57,9 @@ func run() error {
 		showVer  = flag.Bool("version", false, "打印版本号后退出")
 		showKey  = flag.Bool("gen-secret", false, "生成一个随机 JWT 签名密钥后退出（便于写入配置）")
 		showHash = flag.String("gen-password-hash", "", "把给定明文密码转成 bcrypt 哈希后退出（便于写入配置）")
+
+		pluginSocketDir = flag.String("plugin-socket-dir", "",
+			"插件 Unix socket 存放目录（留空则使用 <临时目录>/lipanel-plugins，权限 0700）")
 	)
 	flag.Parse()
 
@@ -108,12 +119,30 @@ func run() error {
 		return err
 	}
 
+	// 插件管理器：注册全部内置插件，并把 socket 目录放在私有目录下。
+	pluginManager, err := plugin.NewManager(plugin.Options{
+		SocketDir: *pluginSocketDir,
+		Logger:    logger,
+	})
+	if err != nil {
+		return err
+	}
+	if err := pluginManager.RegisterAllBuiltins(); err != nil {
+		return err
+	}
+	logger.Info("插件系统已就绪",
+		"builtin_count", len(plugin.BuiltinIDs()),
+		"plugins", plugin.BuiltinIDs(),
+		"socket_dir", pluginManager.SocketDir(),
+	)
+
 	srv, err := server.New(server.Options{
 		Addr:      bootstrap.Config.Addr,
 		Logger:    logger,
 		Version:   version,
 		StaticDir: *staticDir,
 		Auth:      authenticator,
+		Plugins:   pluginManager,
 	})
 	if err != nil {
 		return err
@@ -140,6 +169,11 @@ func run() error {
 
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			return err
+		}
+		// 停止插件进程：核心退出却留下孤儿插件进程会占着 socket，
+		// 下次启动时还会误连到一个「上辈子的」插件上。
+		if err := pluginManager.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("停止插件进程时出现问题", "err", err)
 		}
 		// 等待 Serve 收尾，忽略其返回的 ErrServerClosed。
 		if err := <-serveErr; err != nil {

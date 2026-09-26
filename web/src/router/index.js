@@ -24,6 +24,22 @@ const routes = [
     meta: { title: '系统概览' },
   },
   {
+    path: '/plugins',
+    name: 'plugin-list',
+    component: () => import('@/views/PluginListView.vue'),
+    meta: { title: '插件管理' },
+  },
+  {
+    // 插件前端挂载点：:id 由 PluginHostView 交给前端注册表解析。
+    //
+    // 用 :id 通配而不是给每个插件写一条静态路由，是为了让「新增插件」
+    // 完全不需要改动本文件——这正是「插件前端挂载插槽」的意义。
+    path: '/plugins/:id',
+    name: 'plugin-view',
+    component: () => import('@/views/PluginHostView.vue'),
+    meta: { title: '插件' },
+  },
+  {
     // 兜底：未匹配的路径一律回主页，由主页的守卫决定是否跳登录页。
     path: '/:pathMatch(.*)*',
     redirect: '/',

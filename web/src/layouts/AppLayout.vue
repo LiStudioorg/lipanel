@@ -1,0 +1,177 @@
+<script setup>
+// 应用通用布局：顶栏 + 菜单 + 内容区。
+//
+// 抽出来的原因：阶段三开始有了多个页面（概览 / 插件管理 / 插件页面），
+// 继续把 header 写在每个页面里会迅速产生重复代码。
+//
+// 菜单是「插件前端挂载插槽」的一部分：
+// builtinMenus 是核心功能，pluginMenus 由 /api/plugins 返回的
+// Frontend 元数据动态生成——新增一个内置插件，菜单里就自动多一项，
+// 不需要改动本文件。
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { authStore } from '@/stores/auth'
+import { ApiError } from '@/api/client'
+import { fetchPlugins } from '@/api/plugins'
+import { hasPluginView, resolveNavIcon } from '@/plugins/registry'
+
+const route = useRoute()
+const router = useRouter()
+const message = useMessage()
+const dialog = useDialog()
+
+const loggingOut = ref(false)
+
+// plugins 用于动态菜单。加载失败不阻断页面渲染：
+// 插件系统不可用不该让整个面板无法使用，因此只记录错误、菜单少几项。
+const plugins = ref([])
+const pluginMenuError = ref('')
+
+// builtinMenus 是核心自带的功能入口。
+const builtinMenus = [
+  { key: 'dashboard', label: '系统概览', icon: '📊', to: { name: 'dashboard' } },
+  { key: 'plugins', label: '插件管理', icon: '🧩', to: { name: 'plugin-list' } },
+]
+
+// pluginMenus 把「已运行 + 声明了前端入口 + 前端确实有实现」的插件
+// 转成菜单项。
+//
+// 只有 running 的插件才进菜单：插件没跑起来时点进去必然 503，
+// 那是很差的体验；管理页才是启动插件的地方。
+const pluginMenus = computed(() =>
+  plugins.value
+    .filter((p) => p.state === 'running' && p.frontend?.nav_title && hasPluginView(p.frontend?.entry))
+    .map((p) => ({
+      key: `plugin-${p.id}`,
+      label: p.frontend.nav_title,
+      icon: resolveNavIcon(p.frontend.nav_icon),
+      to: { name: 'plugin-view', params: { id: p.id } },
+    })),
+)
+
+// menuOptions 合并核心菜单与插件菜单。
+const menuOptions = computed(() => [
+  ...builtinMenus,
+  ...(pluginMenus.value.length
+    ? [{ key: 'plugin-group', label: '插件', icon: '🔌', children: pluginMenus.value }]
+    : []),
+])
+
+// activeKey 决定哪个菜单项高亮。
+const activeKey = computed(() => {
+  if (route.name === 'plugin-view') return `plugin-${route.params.id}`
+  return route.name
+})
+
+async function loadPlugins() {
+  try {
+    const data = await fetchPlugins()
+    plugins.value = data.plugins || []
+    pluginMenuError.value = ''
+  } catch (err) {
+    plugins.value = []
+    // 401 交给全局处理（跳登录页），这里只提示其它错误。
+    pluginMenuError.value =
+      err instanceof ApiError && err.isUnauthorized ? '' : err?.message || '插件列表加载失败'
+  }
+}
+
+onMounted(loadPlugins)
+
+// 路由变化时刷新插件列表：
+// 用户刚在管理页启动了插件，菜单应当立刻出现对应入口，
+// 否则要刷新整页才能看到，体验很差。
+watch(
+  () => route.fullPath,
+  () => {
+    loadPlugins()
+  },
+)
+
+// confirmLogout 二次确认：登出会打断当前操作，值得一次确认。
+function confirmLogout() {
+  dialog.warning({
+    title: '确认登出',
+    content: '登出后需要重新输入账号密码，确定继续吗？',
+    positiveText: '登出',
+    negativeText: '取消',
+    onPositiveClick: doLogout,
+  })
+}
+
+async function doLogout() {
+  loggingOut.value = true
+  try {
+    await authStore.logout()
+    message.success('已登出')
+    await router.replace({ name: 'login' })
+  } catch (err) {
+    // doLogout 内部已清本地状态，这里只提示后端可能未同步。
+    message.warning(
+      err instanceof ApiError
+        ? `本地已登出，但通知后端失败：${err.message}`
+        : '本地已登出，但通知后端失败',
+    )
+    await router.replace({ name: 'login' })
+  } finally {
+    loggingOut.value = false
+  }
+}
+</script>
+
+<template>
+  <n-layout style="min-height: 100vh">
+    <n-layout-header bordered class="app-header">
+      <n-space align="center" :size="12">
+        <n-h2 style="margin: 0">lipanel</n-h2>
+      </n-space>
+
+      <n-space align="center" :size="12">
+        <n-text depth="3">
+          当前用户：<strong>{{ authStore.state.username || '-' }}</strong>
+        </n-text>
+        <n-button size="small" :loading="loggingOut" @click="confirmLogout">登出</n-button>
+      </n-space>
+    </n-layout-header>
+
+    <n-layout has-sider position="absolute" style="top: 65px">
+      <n-layout-sider bordered :width="220" :native-scrollbar="false">
+        <n-menu
+          :value="activeKey"
+          :options="menuOptions"
+          :root-indent="18"
+          :default-expand-all="true"
+        />
+
+        <!-- 插件列表加载失败时给出可见提示，而不是让菜单静默少几项 -->
+        <n-alert
+          v-if="pluginMenuError"
+          type="warning"
+          :bordered="false"
+          style="margin: 12px; font-size: 12px"
+        >
+          插件菜单不可用：{{ pluginMenuError }}
+        </n-alert>
+      </n-layout-sider>
+
+      <n-layout-content class="app-content">
+        <slot />
+      </n-layout-content>
+    </n-layout>
+  </n-layout>
+</template>
+
+<style scoped>
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 24px;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.app-content {
+  padding: 24px;
+}
+</style>

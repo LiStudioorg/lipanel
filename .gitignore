@@ -7,7 +7,10 @@
 node_modules/
 web/node_modules/
 # 本地 npm 缓存（沙箱/HOME 不可写时使用）
-web/.npm-cache/
+# 用 **/ 前缀而不是 web/.npm-cache/：在 web/ 目录内执行
+# `npm_config_cache=web/.npm-cache npm run build` 会生成
+# web/web/.npm-cache 这种嵌套路径，只写死一层是拦不住的。
+**/.npm-cache/
 
 # ---------- 前端构建产物 ----------
 # 注意：不能写成 `web/dist/`（整目录忽略），否则 web/dist/.gitkeep 无法入库，

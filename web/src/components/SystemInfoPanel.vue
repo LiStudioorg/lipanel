@@ -3,6 +3,9 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { fetchSystemInfo, ApiError } from '@/api/client'
 import { authStore } from '@/stores/auth'
+// 格式化函数已抽到 utils/format.js：插件版系统信息视图需要用同一套规则，
+// 内联两份会出现「同一个数字在两处显示不一致」的问题。
+import { formatBytes, formatUptime, percentStatus, usageText } from '@/utils/format'
 
 const message = useMessage()
 const router = useRouter()
@@ -38,56 +41,6 @@ async function load() {
 }
 
 onMounted(load)
-
-// ---------- 展示辅助 ----------
-
-// formatBytes 把字节数转为人类可读单位（GiB/MiB）。
-function formatBytes(bytes) {
-  if (typeof bytes !== 'number' || Number.isNaN(bytes) || bytes <= 0) {
-    return '0 B'
-  }
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
-  let value = bytes
-  let i = 0
-  while (value >= 1024 && i < units.length - 1) {
-    value /= 1024
-    i += 1
-  }
-  // 大于 10 时保留一位小数即可，避免数字太长不好读。
-  return `${value >= 10 || i === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[i]}`
-}
-
-// formatUptime 把秒数转为「3 天 4 小时 5 分」。
-function formatUptime(seconds) {
-  if (typeof seconds !== 'number' || seconds < 0) {
-    return '-'
-  }
-  const days = Math.floor(seconds / 86400)
-  const hours = Math.floor((seconds % 86400) / 3600)
-  const minutes = Math.floor((seconds % 3600) / 60)
-
-  const parts = []
-  if (days > 0) parts.push(`${days} 天`)
-  if (hours > 0) parts.push(`${hours} 小时`)
-  // 天/小时都没有时才显示分钟，避免「0 分」这种无意义信息。
-  if (parts.length === 0 || minutes > 0) parts.push(`${minutes} 分`)
-  return parts.join(' ')
-}
-
-// percentStatus 按使用率返回进度条颜色，让高负载一眼可见。
-function percentStatus(percent) {
-  if (percent >= 90) return 'error'
-  if (percent >= 75) return 'warning'
-  return 'success'
-}
-
-// usageText 生成「已用 / 总量 (百分比)」形式的说明文字。
-function usageText(usedBytes, totalBytes, percent) {
-  if (!totalBytes) {
-    return '不可用'
-  }
-  return `${formatBytes(usedBytes)} / ${formatBytes(totalBytes)}（${percent}%）`
-}
 
 // 交换分区未启用时单独提示，而不是显示一个恒为 0 的进度条。
 const swapEnabled = computed(() => (info.value?.swap?.total_bytes ?? 0) > 0)

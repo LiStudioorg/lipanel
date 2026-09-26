@@ -40,6 +40,16 @@ const routes = [
     meta: { title: '服务管理' },
   },
   {
+    // 文件管理页（阶段四 4.2）。
+    //
+    // 同样是核心内置能力 + 静态路由：文件读写是面板的基础运维功能，
+    // 不该依赖插件机制是否可用（与 /services 同样的架构决定）。
+    path: '/files',
+    name: 'file-manager',
+    component: () => import('@/views/FileView.vue'),
+    meta: { title: '文件管理' },
+  },
+  {
     // 插件操作审计页（阶段三 3.3）。
     // 必须放在 "/plugins/:id" 之前：否则 "audit" 会被当成插件 ID
     // 命中了通配路由，打开审计页会变成"插件 audit 不存在"。

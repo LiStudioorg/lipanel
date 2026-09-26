@@ -29,6 +29,7 @@ import (
 
 	"lipanel/internal/auth"
 	"lipanel/internal/config"
+	"lipanel/internal/file"
 	"lipanel/internal/plugin"
 	"lipanel/internal/server"
 	"lipanel/internal/service"
@@ -105,6 +106,13 @@ func run() error {
 
 		serviceTimeout = flag.Duration("service-timeout", service.DefaultCommandTimeout,
 			"单个服务启停操作中每次 systemctl 调用的超时（如 30s、2m）")
+
+		fileRoots = flag.String("file-root", file.DefaultRoot,
+			"文件管理允许访问的根目录，多个用逗号分隔（安全白名单；用户无法访问其外的任何路径）")
+		fileMaxUpload = flag.Int64("file-max-upload", file.DefaultMaxUploadBytes,
+			"单次上传文件的大小上限（字节，默认 128MiB）")
+		fileMaxEdit = flag.Int64("file-max-edit", file.DefaultMaxEditBytes,
+			"内置文本编辑器可打开/保存的最大文件（字节，默认 2MiB）")
 	)
 	flag.Parse()
 
@@ -236,6 +244,45 @@ func run() error {
 			"reason", serviceManager.UnavailableReason())
 	}
 
+	// 文件管理器（阶段四 4.2）。
+	//
+	// 审计同样是「统一落盘、分别查询」：与插件/服务审计共用同一个 -audit-log
+	// 文件（JSONL 追加写），但有独立的类型、环形缓冲与查询接口
+	// （/api/files/audit），互不污染。
+	fileAuditor, err := file.NewAuditor(file.AuditOptions{
+		Capacity: *pluginAuditBuf,
+		Path:     *pluginAuditLog,
+		Logger:   logger,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fileAuditor.Close() }()
+
+	fileRootList := splitList(*fileRoots)
+	fileManager, err := file.NewManager(file.ManagerOptions{
+		Roots:          fileRootList,
+		MaxUploadBytes: *fileMaxUpload,
+		MaxEditBytes:   *fileMaxEdit,
+		Logger:         logger,
+		Auditor:        fileAuditor,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化文件管理失败: %w", err)
+	}
+	logger.Info("文件管理已就绪",
+		"roots", fileRootList,
+		"max_upload_bytes", *fileMaxUpload,
+		"max_edit_bytes", *fileMaxEdit,
+	)
+	// 根目录设为 "/" 时给出显式告警：这不是错误（面板管理员本就该能管理整机），
+	// 但它是**最容易被忽视的一处授权**——等于把整台服务器的文件读写交给了
+	// 任何一个能登录面板的账号。宁可多一句提醒，也不要让用户事后才发现。
+	if len(fileRootList) == 1 && fileRootList[0] == "/" {
+		logger.Warn("文件管理的可访问根目录为 /（整机文件均可读写）",
+			"hint", "如需收窄范围，可用 -file-root /home,/etc/nginx 指定白名单目录")
+	}
+
 	// 注入内嵌前端资源（go:embed 在根目录，见本文件顶部 distFS）。
 	// 仅在没有用 -static-dir 覆盖时才需要解析；解析失败属构建错误，直接终止。
 	var (
@@ -260,6 +307,7 @@ func run() error {
 		Auth:      authenticator,
 		Plugins:   pluginManager,
 		Services:  serviceManager,
+		Files:     fileManager,
 	})
 	if err != nil {
 		return err
@@ -299,6 +347,23 @@ func run() error {
 		logger.Info("服务已退出")
 		return nil
 	}
+}
+
+// splitList 把逗号分隔的启动参数拆成去空白、去空项的字符串切片。
+//
+// 单独一个函数而不是用 strings.Split 直接塞给调用方：
+// `-file-root "/home, /srv "` 这种写法里的空格必须被去掉，
+// 否则会得到一个叫 " /srv " 的根目录，file.NewResolver 会报
+// "根目录不可用"，用户对着一个看起来完全正常的参数无从排查。
+func splitList(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 // newLogger 依据 level 构造结构化日志器，未知级别返回错误而非静默降级。

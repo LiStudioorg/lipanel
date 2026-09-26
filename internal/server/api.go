@@ -31,6 +31,12 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// "审计路径必须先于 {name} 通配注册"的顺序问题，
 	// 集中在一个注册函数里比散落在两处更不容易写错。
 	s.registerServiceRoutes(mux)
+
+	// ---------- 文件管理（阶段四 4.2，核心自带）----------
+	//
+	// 同样是核心自带能力（不做成插件）：新增 file_api.go 承载 handler，
+	// internal/file 承载路径安全、权限与审计。这里只负责"登记"。
+	s.registerFileRoutes(mux)
 }
 
 // healthResponse 是 /api/health 的响应体，字段使用 snake_case 以便前端直接消费。

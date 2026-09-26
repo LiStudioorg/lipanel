@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"lipanel/internal/auth"
+	"lipanel/internal/file"
 	"lipanel/internal/plugin"
 	"lipanel/internal/service"
 	"lipanel/internal/sysinfo"
@@ -52,6 +53,13 @@ type Options struct {
 	// 它也只会返回「不可用」而不是报错——降级判断在 service 包内，
 	// 这里不需要也不应该重复判断。
 	Services *service.Manager
+	// Files 提供文件管理能力（阶段四 4.2，核心自带）。
+	// 为 nil 时文件相关接口返回 JSON 503，老测试无需改动即可继续通过。
+	//
+	// 与 service 的区别：文件管理不存在"系统不支持"的降级分支——
+	// 它的可用性完全由「有没有配白名单根目录」决定，而这在构造
+	// file.Manager 时就已经确定（没有根目录直接构造失败）。
+	Files *file.Manager
 }
 
 // Server 封装 HTTP 服务及其依赖。
@@ -63,6 +71,7 @@ type Server struct {
 	plugins     *plugin.Manager
 	pluginProxy *plugin.Proxy
 	serviceMgr  *service.Manager
+	fileMgr     *file.Manager
 	handler     http.Handler
 	httpSrv     *http.Server
 }
@@ -106,6 +115,9 @@ func New(opts Options) (*Server, error) {
 	// 服务管理（阶段四 4.1）：同样只在 main 注入时启用。
 	// 未注入时 /api/services 返回 503，老测试无需改动即可继续通过。
 	s.serviceMgr = opts.Services
+
+	// 文件管理（阶段四 4.2）：同上。
+	s.fileMgr = opts.Files
 
 	mux := http.NewServeMux()
 	// 服务路由由 registerAPIRoutes 内部统一注册（核心自带功能，

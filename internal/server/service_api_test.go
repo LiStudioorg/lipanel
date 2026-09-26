@@ -138,15 +138,74 @@ func newServiceTestServerWithoutManager(t *testing.T) *Server {
 }
 
 // rebuildTestRoutes 重新组装路由，让测试中后注入的依赖生效。
+//
+// 按**生产环境的真实组装顺序**注册：API 路由在前，SPA 兜底在后。
+// 兜底 handler 必须存在：否则"未注册的 /api 路径不能落到 HTML 兜底"
+// 这类用例验证不出任何东西（那条路径根本不存在，见 4.2 的一次实测教训）。
 func rebuildTestRoutes(s *Server) {
 	mux := http.NewServeMux()
 	s.registerAPIRoutes(mux)
 	s.registerPluginRoutes(mux)
-	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.handler = s.withRecovery(s.withRequestLog(s.withSPAFallback(mux)))
+}
+
+// withSPAFallback 给测试路由装上前端兜底。
+//
+// 语义与生产的 static.go 保持一致，尤其是**顺序**：
+//
+//	① 未注册的 /api* 路径 → JSON 404（先判，绝不能落到 HTML）；
+//	② 其余未命中路径      → HTML 兜底页面。
+//
+// ⚠️ 两个坑都在 4.2 实现时真的踩过：
+//   - 让 mux 自己的 "/" 兜底先跑：未注册的 /api 路径会先被渲染成
+//     HTML（200），既拿不到 JSON，也让"不落到兜底"的用例失去意义；
+//   - 反过来无条件先判 /api 前缀：会把已注册的 /api/login 一起吞掉，
+//     症状是**所有依赖登录的测试同时失败**。
+//
+// 因此这里让 mux 只承载**已注册**路由，未命中由本函数按 /api 前缀分流，
+// 与 static.go 里的分支判断逐条对应。
+func (s *Server) withSPAFallback(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, r)
+
+		if r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/") {
+			// /api 前缀：未注册（含 mux 自身给出的 404 文本）统一改写为 JSON，
+			// 与 static.go 的行为一致。
+			if rec.Code == http.StatusNotFound &&
+				strings.Contains(rec.Body.String(), "page not found") {
+				writeJSON(w, s.logger, http.StatusNotFound, map[string]string{
+					"error": "接口不存在: " + r.URL.Path,
+				})
+				return
+			}
+			copyResponse(w, rec)
+			return
+		}
+
+		if rec.Code != http.StatusNotFound {
+			copyResponse(w, rec)
+			return
+		}
+		// 非 /api 的未命中路径：返回前端页面。
 		w.Header().Set("Content-Type", "text/html")
 		_, _ = w.Write([]byte("<!doctype html>"))
-	}))
-	s.handler = s.withRecovery(s.withRequestLog(mux))
+	})
+}
+
+// copyResponse 把缓冲的响应原样写回。
+//
+// 为什么要缓冲：ServeMux 对"未注册的 /api 路径"给出的是自带的
+// 404 文本，而我们希望像 static.go 那样改成 JSON——
+// 只能在写出之前判断并改写，因此必须先把响应接住。
+func copyResponse(w http.ResponseWriter, rec *httptest.ResponseRecorder) {
+	for k, vs := range rec.Header() {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(rec.Code)
+	_, _ = w.Write(rec.Body.Bytes())
 }
 
 // loginAndDo 登录后发起请求，返回响应记录器。

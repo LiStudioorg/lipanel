@@ -17,11 +17,10 @@ web/dist/*
 !web/dist/.gitkeep
 
 # ---------- Go 编译产物 ----------
-# 单二进制产物：build.sh 输出到 dist/panel，手动 go build 可能产出根目录 panel
-panel
+# 统一产物名：lipanel（与仓库名一致，由 build.sh 输出到 dist/）
+/lipanel
 /dist/
 /bin/
-/lipanel
 *.exe
 *.test
 

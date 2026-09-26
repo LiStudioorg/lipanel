@@ -9,8 +9,19 @@ import (
 
 // registerAPIRoutes 注册所有 /api 下的接口。
 // 新增接口时统一在此登记，保证路由集中可查。
+//
+// 鉴权采用「按路由显式挂载」的白名单方式：只有包了 s.auth.RequireAuth 的接口才需要登录。
+// 相比全局拦截 /api/*，这里多写一行，但新增接口不会因为白名单漏配而意外裸奔，
+// 公开接口（health/login）也无需额外的豁免名单。
 func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
+	// ---------- 公开接口 ----------
 	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("POST /api/login", s.handleLogin)
+	mux.HandleFunc("POST /api/logout", s.handleLogout)
+
+	// ---------- 需要登录的接口 ----------
+	mux.Handle("GET /api/auth/me", s.auth.RequireAuth(http.HandlerFunc(s.handleAuthMe)))
+	mux.Handle("GET /api/system/info", s.auth.RequireAuth(http.HandlerFunc(s.handleSystemInfo)))
 }
 
 // healthResponse 是 /api/health 的响应体，字段使用 snake_case 以便前端直接消费。
@@ -18,14 +29,23 @@ type healthResponse struct {
 	Status  string `json:"status"`
 	Version string `json:"version"`
 	Time    string `json:"time"`
+	// TokenTTLSeconds 告诉前端会话时长，便于提示「登录已过期」。
+	TokenTTLSeconds int `json:"token_ttl_seconds"`
+	// HasFixedSecret 为 false 表示签名密钥是每次启动随机生成的（重启需重新登录）。
+	HasFixedSecret bool `json:"has_fixed_secret"`
 }
 
 // handleHealth 返回服务健康状态，供前端首屏探活与联调使用。
+//
+// 该接口保持公开且极轻量：它可能被监控系统高频轮询，
+// 因此不读 /proc、不查 Cookie，只返回内存中的常量信息。
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.logger, http.StatusOK, healthResponse{
-		Status:  "ok",
-		Version: s.opts.Version,
-		Time:    time.Now().Format(time.RFC3339),
+		Status:          "ok",
+		Version:         s.opts.Version,
+		Time:            time.Now().Format(time.RFC3339),
+		TokenTTLSeconds: int(s.auth.TTL().Seconds()),
+		HasFixedSecret:  !s.auth.SecretGenerated(),
 	})
 }
 

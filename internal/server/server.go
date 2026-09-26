@@ -13,6 +13,9 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"lipanel/internal/auth"
+	"lipanel/internal/sysinfo"
 )
 
 // Options 是构造 Server 所需的配置。
@@ -25,12 +28,16 @@ type Options struct {
 	Version string
 	// StaticDir 是前端静态资源目录；为空表示使用内置 embed 资源（见 static.go）。
 	StaticDir string
+	// Auth 提供登录鉴权能力；为 nil 时使用 New 内部的默认实现（见 buildAuth）。
+	Auth *auth.Authenticator
 }
 
 // Server 封装 HTTP 服务及其依赖。
 type Server struct {
 	opts    Options
 	logger  *slog.Logger
+	auth    *auth.Authenticator
+	sysinfo *sysinfo.Collector
 	handler http.Handler
 	httpSrv *http.Server
 }
@@ -49,6 +56,19 @@ func New(opts Options) (*Server, error) {
 	}
 
 	s := &Server{opts: opts, logger: logger}
+
+	// 注入鉴权组件：未显式传入时构造一个仅用于本地开发的默认实例。
+	// 生产环境必须由 main 传入（见 cmd/lipanel 的启动参数校验）。
+	if opts.Auth != nil {
+		s.auth = opts.Auth
+	} else {
+		a, err := buildAuth(logger)
+		if err != nil {
+			return nil, err
+		}
+		s.auth = a
+	}
+	s.sysinfo = sysinfo.NewCollector()
 
 	mux := http.NewServeMux()
 	s.registerAPIRoutes(mux)

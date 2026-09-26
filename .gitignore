@@ -9,6 +9,8 @@ web/node_modules/
 # 前端构建产物不入库，但保留占位文件（go:embed 需要目录非空）
 web/dist/*
 !web/dist/.gitkeep
+# 本地 npm 缓存（沙箱内 HOME 不可写时使用）
+web/.npm-cache/
 
 # 测试与覆盖率
 *.test

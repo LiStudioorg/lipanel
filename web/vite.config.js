@@ -6,6 +6,27 @@ import AutoImport from 'unplugin-auto-import/vite'
 import Components from 'unplugin-vue-components/vite'
 import { NaiveUiResolver } from 'unplugin-vue-components/resolvers'
 
+// RUNTIME_RENAMES 是需要改名的入口：**产物文件名** → 固定的运行时路径。
+//
+//   src/runtime.js          → /assets/vue.js
+//     宿主页面 importmap 里裸说明符 "vue" 的目标（3.2 起）
+//   src/frame-runtime.js    → /assets/plugin-runtime.js
+//     插件沙箱 iframe 里 importmap 的目标（3.3 新增）
+//
+// 两者都必须落在**不带内容哈希**的固定路径上，否则 importmap 没法写死目标；
+// 而 Vite 默认给入口 chunk 带哈希，因此只能在构建期改名。
+//
+// 注意 key 用的是**产物名**：rollupOptions.input 的键是 frameRuntime
+// （驼峰入口名），Vite 产出的是 assets/frameRuntime.js，
+// 与源文件名 frame-runtime.js 并不一致（3.3 踩过坑，见「已知坑位」41）。
+//
+// 放在模块作用域的原因：renderChunk（改代码引用）与 generateBundle（改文件名）
+// 必须使用**同一份**映射，否则两者一旦漂移就会产出「引用不存在文件」的产物。
+const RUNTIME_RENAMES = {
+  'assets/runtime.js': 'assets/vue.js',
+  'assets/frameRuntime.js': 'assets/plugin-runtime.js',
+}
+
 // 构建产物直接输出到 web/dist，供 Go 的 go:embed 打包进单二进制。
 export default defineConfig({
   plugins: [
@@ -104,36 +125,100 @@ export default defineConfig({
     // 请求会落到 SPA 兜底返回 index.html，浏览器按 MIME 拒绝执行，
     // 表现为「主应用正常、插件前端加载失败」。
     //
-    // 实现方式：在 generateBundle 阶段直接改 chunk 的文件名。
+    // 实现方式：见下方 renderChunk（改代码引用）与 generateBundle（改文件名）两个钩子。
+    //
+    // ⚠️ 改名必须**同时**处理两处，缺一不可（下面两个钩子各负责一处）：
+    //
+    //   ① 文件命名        → generateBundle 改 chunk.fileName 及相关元数据
+    //   ② **代码里的引用** → renderChunk 改代码字符串
+    //
+    // 只做 ① 是一个真实发生过的 P1 缺陷：generateBundle 里改 fileName
+    // 只影响 Rollup 的元数据，**不会**触碰已经生成好的代码字符串。
+    // main.js 用的是 `await import('./runtime.js')`，产物里就写死成
+    // `import("./runtime.js")`——文件已改名，引用还是旧名，
+    // 浏览器去请求 /assets/runtime.js 拿到 SPA 兜底的 index.html
+    // （200 但 Content-Type: text/html），模块按 MIME 被拒绝执行，
+    // **整个页面白屏**。而 dev 模式走源码路径、根本没有这个改名，
+    // 所以只在生产构建里复现，极难排查。
+    //
+    // 为什么用 renderChunk 而不是在 generateBundle 里改 code：
+    // renderChunk 处于「代码已生成、即将写入 bundle」的阶段，
+    // 此处返回新 code 会被 Rollup 正常采纳；而 generateBundle 阶段
+    // 代码已定稿，改 code 属于事后打补丁且不一定生效。
+    // 职责因此更清晰：renderChunk 管代码内容，generateBundle 管文件命名。
+    //
     // 这里必须用闭包里的 this 而非箭头函数——Rollup 通过 this 暴露插件上下文。
     {
       name: 'lipanel-runtime-entry',
       apply: 'build',
+
+      // ---------- ① 代码内容：替换对已改名 chunk 的引用 ----------
+      renderChunk(code, chunk) {
+        // 只处理「代码里真的出现了旧路径」的 chunk，其余返回 null
+        // （表示不改动），既省开销也彻底排除误伤其它 chunk 的可能。
+        //
+        // 安全性说明（为什么这些替换不会误伤）：
+        //   替换目标是**带路径前缀的具体文件名**（"runtime.js" 前必须有
+        //   "./" 或 "assets/"），而不是裸词 "runtime"。因此：
+        //     · 不会命中变量名（如 const runtime = ...）；
+        //     · 不会命中其它 chunk（如 runtime-dom.esm-bundler-XXXX.js，
+        //       因为它不以 ./runtime.js 或 assets/runtime.js 结尾）；
+        //     · 不会命中普通文本（前后缀已经限定它是模块说明符形态）。
+        //
+        // 映射直接由 RUNTIME_RENAMES 推导，避免两处清单各自维护而漂移：
+        //   assets/runtime.js → 相对形态 ./runtime.js 与绝对形态 assets/runtime.js
+        const replacements = Object.entries(RUNTIME_RENAMES).flatMap(([from, to]) => {
+          const base = from.replace(/^assets\//, '')
+          const toBase = to.replace(/^assets\//, '')
+          return [
+            // 相对说明符：动态 import('./runtime.js') / import "./runtime.js"
+            [`./${base}`, `./${toBase}`],
+            // 绝对形式：Rollup 在解析 base 或 import.meta.url 后可能产出此形态
+            [from, to],
+          ]
+        })
+
+        let next = code
+        let changed = false
+        for (const [from, to] of replacements) {
+          if (next.includes(from)) {
+            next = next.split(from).join(to)
+            changed = true
+          }
+        }
+
+        if (!changed) return null
+
+        this.info(
+          `[lipanel-runtime-entry] ${chunk.fileName}: ` +
+            '已把代码中的 runtime.js 引用重写为 vue.js',
+        )
+        return { code: next, map: null }
+      },
+
+      // ---------- ② 文件命名：把入口 chunk 改成固定路径 ----------
       generateBundle(_options, bundle) {
-        // 需要改名的入口：源文件 → 固定的运行时路径。
-        //
-        //   src/runtime.js          → /assets/vue.js
-        //     宿主页面 importmap 里裸说明符 "vue" 的目标（3.2 起）
-        //   src/frame-runtime.js    → /assets/plugin-runtime.js
-        //     插件沙箱 iframe 里 importmap 的目标（3.3 新增）
-        //
-        // 两者都必须落在**不带内容哈希**的固定路径上，否则 importmap
-        // 没法写死目标；而 Vite 默认给入口 chunk 带哈希，因此只能在此改名。
-        const renames = {
-          'assets/runtime.js': 'assets/vue.js',
-          // 注意 key 用的是 **入口名**（rollupOptions.input 的键 frameRuntime），
-          // 不是源文件名 frame-runtime.js —— Vite 产出的是 assets/frameRuntime.js。
-          'assets/frameRuntime.js': 'assets/plugin-runtime.js',
+        // 先校验所有需要改名的入口都真实存在。
+        // 静默跳过是 3.3 踩过的坑（改名没生效却毫无提示），
+        // 而这里的失败后果更严重：产物会引用一个根本不存在的路径。
+        // 因此缺一个就**直接让构建失败**，绝不产出一个「构建成功但
+        // 运行时白屏」的二进制。
+        const missing = Object.keys(RUNTIME_RENAMES).filter((from) => !bundle[from])
+        if (missing.length > 0) {
+          this.error(
+            `[lipanel-runtime-entry] 期望的入口 chunk 不存在: ${missing.join(', ')}。` +
+              '请检查 rollupOptions.input 的入口名与 entryFileNames 是否与本插件同步。',
+          )
         }
 
-        for (const [from, to] of Object.entries(renames)) {
-          const chunk = bundle[from]
-          if (!chunk) continue
-          chunk.fileName = to
+        for (const [from, to] of Object.entries(RUNTIME_RENAMES)) {
+          bundle[from].fileName = to
         }
 
-        // 同步修正引用这些 chunk 的其它 bundle（index.html / 动态 import）。
-        const resolve = (name) => renames[name] || name
+        // 同步修正引用这些 chunk 的其它 bundle 的**元数据**
+        // （index.html 的 script src、动态 import 记录等）。
+        // 注意：这里只改元数据，代码字符串由上面的 renderChunk 负责。
+        const resolve = (name) => RUNTIME_RENAMES[name] || name
         for (const item of Object.values(bundle)) {
           if (item.type !== 'chunk') continue
           if (item.imports) item.imports = item.imports.map(resolve)

@@ -10,6 +10,7 @@ package sysinfo
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -32,6 +33,9 @@ func (c cpuStat) busy() uint64 {
 
 // readCPUStat 读取 /proc/stat 的汇总行（第一行 "cpu ..."）。
 func readCPUStat() (cpuStat, error) {
+	if !hasProcFS {
+		return cpuStat{}, ErrNotSupported
+	}
 	data, err := os.ReadFile("/proc/stat")
 	if err != nil {
 		return cpuStat{}, fmt.Errorf("读取 /proc/stat 失败: %w", err)
@@ -84,6 +88,11 @@ func usageBetween(prev, cur cpuStat) (float64, bool) {
 
 // cpuCores 统计逻辑核心数（/proc/stat 中 cpuN 行数），失败时退回 runtime.NumCPU。
 func cpuCores() (int, error) {
+	if !hasProcFS {
+		// 没有 /proc 时仍然可以给出逻辑核心数：runtime.NumCPU 在所有平台可用。
+		// 这不是降级为"不可用"，而是换一个同样准确的数据来源。
+		return runtime.NumCPU(), nil
+	}
 	data, err := os.ReadFile("/proc/stat")
 	if err != nil {
 		return 0, fmt.Errorf("读取 /proc/stat 失败: %w", err)
@@ -104,6 +113,9 @@ func cpuCores() (int, error) {
 // cpuModel 从 /proc/cpuinfo 提取 CPU 型号。
 // ARM 平台字段名是 "Hardware" 或 "Model"，因此按优先级依次尝试。
 func cpuModel() (string, error) {
+	if !hasProcFS {
+		return "", ErrNotSupported
+	}
 	data, err := os.ReadFile("/proc/cpuinfo")
 	if err != nil {
 		return "", fmt.Errorf("读取 /proc/cpuinfo 失败: %w", err)

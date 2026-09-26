@@ -259,16 +259,6 @@ func TestFindCPUInfoValue(t *testing.T) {
 	}
 }
 
-func TestUtsnameString(t *testing.T) {
-	raw := []int8{'x', '8', '6', '_', '6', '4', 0, 0}
-	if got := utsnameString(raw); got != "x86_64" {
-		t.Errorf("utsnameString = %q, 期望 %q", got, "x86_64")
-	}
-	if got := utsnameString(nil); got != "" {
-		t.Errorf("空输入应返回空串，实际 %q", got)
-	}
-}
-
 func TestRound2(t *testing.T) {
 	cases := map[float64]float64{
 		12.3456: 12.35,

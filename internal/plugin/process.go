@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -89,9 +88,10 @@ func (p *process) Start(ctx context.Context, binPath string, env []string) (Star
 	// 后续阶段可改为按插件分流到独立文件。
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	// 独立进程组：停止时可以向整个组发信号，
-	// 避免插件自己拉起的子进程变成孤儿。
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// 独立进程组：停止时可以向整个组发信号，避免插件自己拉起的子进程
+	// 变成孤儿。平台差异（Windows/Plan9 无进程组）由 setProcessGroup 吸收，
+	// 见 process_unix.go / process_windows.go / process_stub.go。
+	setProcessGroup(cmd)
 
 	if err := cmd.Start(); err != nil {
 		return StartResult{}, fmt.Errorf("plugin: 启动插件 %s 进程失败: %w", p.desc.ID, err)
@@ -267,11 +267,9 @@ func (p *process) Stop(timeout time.Duration) error {
 		return nil
 	}
 
-	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
-		// 进程可能刚好自己退出了，这不算错误。
-		if !errors.Is(err, syscall.ESRCH) {
-			p.logger.Warn("向插件进程发送 SIGTERM 失败", "plugin", p.desc.ID, "pid", pid, "err", err)
-		}
+	if err := terminateProcess(pid); err != nil && !isProcessGone(err) {
+		// 进程可能刚好自己退出了（isProcessGone），那不算错误。
+		p.logger.Warn("向插件进程发送终止信号失败", "plugin", p.desc.ID, "pid", pid, "err", err)
 	}
 
 	select {
@@ -281,8 +279,8 @@ func (p *process) Stop(timeout time.Duration) error {
 		// 优雅退出超时：强制杀掉，否则停止接口会一直挂住。
 		p.logger.Warn("插件未在超时内退出，发送 SIGKILL",
 			"plugin", p.desc.ID, "pid", pid, "timeout", timeout)
-		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			p.logger.Warn("发送 SIGKILL 失败", "plugin", p.desc.ID, "pid", pid, "err", err)
+		if err := killProcess(pid); err != nil && !isProcessGone(err) {
+			p.logger.Warn("强制结束插件进程失败", "plugin", p.desc.ID, "pid", pid, "err", err)
 		}
 		select {
 		case <-done:
@@ -311,7 +309,7 @@ func (p *process) kill() {
 	case <-done:
 		// 已经退出，无需再杀。
 	default:
-		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		if err := killProcess(pid); err != nil && !isProcessGone(err) {
 			p.logger.Warn("回收插件进程失败", "plugin", p.desc.ID, "pid", pid, "err", err)
 		}
 		select {

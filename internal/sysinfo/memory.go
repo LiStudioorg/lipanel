@@ -34,6 +34,9 @@ func (m memoryInfo) used() uint64 {
 
 // readMemoryInfo 读取并解析 /proc/meminfo。
 func readMemoryInfo() (memoryInfo, error) {
+	if !hasProcFS {
+		return memoryInfo{}, ErrNotSupported
+	}
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return memoryInfo{}, fmt.Errorf("读取 /proc/meminfo 失败: %w", err)
@@ -101,6 +104,9 @@ type swapInfo struct {
 // readSwapInfo 从 /proc/meminfo 读取交换分区使用情况。
 // SwapTotal 为 0 表示未启用交换分区，属正常情况而非错误。
 func readSwapInfo() (swapInfo, error) {
+	if !hasProcFS {
+		return swapInfo{}, ErrNotSupported
+	}
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return swapInfo{}, fmt.Errorf("读取 /proc/meminfo 失败: %w", err)

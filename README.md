@@ -48,39 +48,89 @@ cd web && npm install && npm run dev
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `-addr` | `127.0.0.1:8080` | HTTP 监听地址 |
+| `-config` | 空 | 配置文件路径（JSON）。**指定后首次启动会自动生成凭据并落盘**；留空则为纯内存模式（不落盘） |
+| `-addr` | `127.0.0.1:8080` | HTTP 监听地址（覆盖配置文件） |
 | `-static-dir` | 空 | 指定磁盘静态目录，留空则用内置 embed 资源 |
-| `-log-level` | `info` | `debug\|info\|warn\|error` |
-| `-admin-user` | `admin` | 管理员用户名 |
+| `-log-level` | `info` | `debug\|info\|warn\|error`（覆盖配置文件） |
+| `-admin-user` | `admin` | 管理员用户名（覆盖配置文件） |
 | `-admin-password` | 空 | 管理员明文密码（≥ 6 位），启动时立即转为 bcrypt 哈希 |
 | `-admin-password-hash` | 空 | 直接提供 bcrypt 哈希（**推荐**，避免明文出现在 `ps` 中） |
-| `-jwt-secret` | 空 | JWT 签名密钥（≥ 16 字节）；留空则每次启动随机生成，**重启后需重新登录** |
-| `-token-ttl` | `2h` | 会话有效期，如 `30m`、`12h` |
+| `-jwt-secret` | 空 | JWT 签名密钥（≥ 16 字节）；留空则读取配置文件或自动生成 |
+| `-token-ttl` | `2h` | 会话有效期，如 `30m`、`12h`（覆盖配置文件） |
 | `-secure-cookie` | `false` | 仅通过 HTTPS 传输会话 Cookie（反代启用 TLS 时开启） |
-| `-gen-secret` | - | 生成一个随机密钥后退出，便于写入配置文件 |
+| `-gen-secret` | - | 生成一个随机密钥后退出，便于写入配置 |
+| `-gen-password-hash` | - | 把给定明文密码转成 bcrypt 哈希后退出，便于写入配置 |
 | `-version` | - | 打印版本号后退出 |
 
-> ⚠️ 未指定密码时使用开发默认口令 `admin` / `admin123`，并在启动日志打印 WARN。
-> **生产环境务必用 `-admin-password` 或 `-admin-password-hash` 指定。**
+**优先级：CLI 参数 > 配置文件 > 内置默认值。**
 
-生成密码哈希与签名密钥：
+> ⚠️ 未指定 `-config` 且未传密码时，使用开发默认口令 `admin` / `admin123` 并打印 WARN。
+> **生产环境请用 `-config`（推荐）或 `-admin-password-hash` 指定。**
+
+## 配置文件与持久化
+
+### 最简用法（推荐）
 
 ```bash
-# 生成 bcrypt 哈希（交互式输入，不回显）
-go run ./cmd/lipanel -gen-secret          # 生成 JWT 签名密钥
+# 首次启动：自动生成 20 位随机密码与 JWT 密钥，写入配置文件
+./dist/lipanel -config /var/lib/lipanel/config.json
 
-# 生产启动示例
-./dist/lipanel -addr 0.0.0.0:8080 \
-  -admin-user admin \
-  -admin-password-hash '$2a$10$....' \
-  -jwt-secret "$(./dist/lipanel -gen-secret)" \
-  -secure-cookie
+# 日志会打印一次生成的密码，请立即抄录：
+#   level=WARN msg=已自动生成管理员密码，请立即抄录保存（此密码不会再显示） password=NexXHQfuDitHkcn4YN5Q
+
+# 之后每次启动只需一个参数，凭据自动读取，无需重复传参
+./dist/lipanel -config /var/lib/lipanel/config.json
 ```
+
+生成的 `config.json`（权限 `0600`，目录 `0700`）：
+
+```json
+{
+  "version": 1,
+  "addr": "127.0.0.1:8080",
+  "log_level": "info",
+  "secure_cookie": false,
+  "auth": {
+    "username": "admin",
+    "password_hash": "$2a$10$f0fpkiQ2d2I0bwSfMM3hoOwkJ19.kCJqRvvl9EZ.cJwaZj8vxdxIS",
+    "jwt_secret": "G7zZ2jZEPhfFULmlZlyPGjOZJpByR_cObAhFvRAD4_M",
+    "token_ttl": "2h"
+  }
+}
+```
+
+### 设计要点
+
+| 项 | 说明 |
+| --- | --- |
+| 格式 | **JSON**，用标准库 `encoding/json`，不引入 YAML 库，**依赖总数仍为 2** |
+| 密码存储 | 只存 bcrypt 哈希，**文件中绝不出现明文**；明文仅在首次启动打印一次 |
+| 权限 | 文件 `0600` / 目录 `0700`；发现已有文件权限过宽时告警但不阻断启动 |
+| 写入安全 | 临时文件 + `fsync` + `rename` 原子替换，断电不会留下半个 JSON |
+| 损坏保护 | 配置非法时**拒绝启动且不覆盖原文件**，避免用户配置被静默清空 |
+| 幂等性 | 用相同参数重复启动不会重写文件（bcrypt 带随机 salt，需先比对再决定） |
+
+### 手工配置
+
+```bash
+# 生成哈希与密钥，然后手工填入 config.json
+./dist/lipanel -gen-password-hash 'my-password'
+./dist/lipanel -gen-secret
+
+# 或临时覆盖配置文件里的值（会被写回文件）
+./dist/lipanel -config /var/lib/lipanel/config.json -addr 0.0.0.0:8080 -secure-cookie
+
+# 完整生产启动示例
+./dist/lipanel -config /etc/lipanel/config.json -secure-cookie
+```
+
+> **忘记密码怎么办**：配置里只有哈希，无法反推。直接指定新密码即可覆盖：
+> `./dist/lipanel -config <路径> -admin-password '新密码'`（会写回文件）。
 
 ## 构建单二进制
 
 ```bash
-./build.sh              # 产物：dist/lipanel（约 6.9 MB）
+./build.sh              # 产物：dist/lipanel（约 7.4 MB）
 ./dist/lipanel -addr 127.0.0.1:8080
 ```
 
@@ -165,12 +215,13 @@ go run ./cmd/lipanel -gen-secret          # 生成 JWT 签名密钥
 - [x] 小目标 3：Vue3 + Vite + Naive UI 前端骨架
 - [x] 小目标 4：前端 embed 进 Go，打包单二进制
 
-### 第二阶段：登录鉴权 + 系统信息面板 ⏳
+### 第二阶段：登录鉴权 + 系统信息面板 ✅
 
 - [x] 2.1 登录接口（bcrypt + JWT HttpOnly Cookie）
 - [x] 2.2 鉴权中间件 + 前端 401 拦截跳登录页
 - [x] 2.3 前端登录页（Naive UI 表单校验 / Loading / 错误提示）
 - [x] 2.4 系统信息接口（`/api/system/info`）
 - [x] 2.5 前端系统信息面板（卡片 + 进度条 + Loading/Error 兜底）
+- [x] 2.6 配置与持久化（`-config` + 凭据自动生成落盘）
 
 详细进度与已知坑位见 [`开发计划.md`](./开发计划.md)。

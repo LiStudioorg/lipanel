@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"lipanel/internal/auth"
+	"lipanel/internal/config"
 	"lipanel/internal/server"
 )
 
@@ -33,19 +34,21 @@ func main() {
 
 func run() error {
 	var (
-		addr      = flag.String("addr", "127.0.0.1:8080", "HTTP 监听地址")
-		staticDir = flag.String("static-dir", "", "前端静态资源目录（留空则使用内置 embed 资源）")
-		logLevel  = flag.String("log-level", "info", "日志级别: debug|info|warn|error")
+		configPath = flag.String("config", "", "配置文件路径（JSON）。指定后首次启动会自动生成密码哈希与签名密钥并落盘")
+		addr       = flag.String("addr", config.DefaultAddr, "HTTP 监听地址（覆盖配置文件）")
+		staticDir  = flag.String("static-dir", "", "前端静态资源目录（留空则使用内置 embed 资源）")
+		logLevel   = flag.String("log-level", config.DefaultLogLevel, "日志级别: debug|info|warn|error（覆盖配置文件）")
 
-		adminUser = flag.String("admin-user", "admin", "管理员用户名")
+		adminUser = flag.String("admin-user", config.DefaultUsername, "管理员用户名（覆盖配置文件）")
 		adminPass = flag.String("admin-password", "", "管理员明文密码（至少 6 位；与 -admin-password-hash 二选一）")
 		adminHash = flag.String("admin-password-hash", "", "管理员密码的 bcrypt 哈希（推荐，避免明文出现在 ps 中）")
-		jwtSecret = flag.String("jwt-secret", "", "JWT 签名密钥（至少 16 字节；留空则每次启动随机生成，重启后需重新登录）")
-		tokenTTL  = flag.Duration("token-ttl", auth.DefaultTokenTTL, "登录会话有效期，如 2h、30m")
+		jwtSecret = flag.String("jwt-secret", "", "JWT 签名密钥（至少 16 字节；留空则读取配置文件或自动生成）")
+		tokenTTL  = flag.Duration("token-ttl", auth.DefaultTokenTTL, "登录会话有效期，如 2h、30m（覆盖配置文件）")
 		secureCk  = flag.Bool("secure-cookie", false, "仅通过 HTTPS 传输会话 Cookie（反向代理已启用 TLS 时开启）")
 
-		showVer = flag.Bool("version", false, "打印版本号后退出")
-		showKey = flag.Bool("gen-secret", false, "生成一个随机 JWT 签名密钥后退出（便于写入配置）")
+		showVer  = flag.Bool("version", false, "打印版本号后退出")
+		showKey  = flag.Bool("gen-secret", false, "生成一个随机 JWT 签名密钥后退出（便于写入配置）")
+		showHash = flag.String("gen-password-hash", "", "把给定明文密码转成 bcrypt 哈希后退出（便于写入配置）")
 	)
 	flag.Parse()
 
@@ -61,27 +64,52 @@ func run() error {
 		fmt.Println(secret)
 		return nil
 	}
-
-	logger, err := newLogger(*logLevel)
-	if err != nil {
-		return err
+	if *showHash != "" {
+		hash, err := auth.HashPassword(*showHash)
+		if err != nil {
+			return err
+		}
+		fmt.Println(hash)
+		return nil
 	}
-	slog.SetDefault(logger)
 
-	authenticator, err := buildAuthenticator(logger, authOptions{
-		user:         *adminUser,
-		password:     *adminPass,
-		passwordHash: *adminHash,
-		jwtSecret:    *jwtSecret,
-		ttl:          *tokenTTL,
-		secureCookie: *secureCk,
+	// 记录哪些参数被显式指定：区分「没写」与「写成了默认值」，
+	// 后者应当覆盖配置文件，只有 flag.Visit 能做到这一点。
+	explicit := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
+	bootstrap, err := config.Bootstrap(config.BootstrapOptions{
+		Path:         *configPath,
+		Set:          explicit,
+		Addr:         *addr,
+		LogLevel:     *logLevel,
+		Username:     *adminUser,
+		Password:     *adminPass,
+		PasswordHash: *adminHash,
+		JWTSecret:    *jwtSecret,
+		TokenTTL:     *tokenTTL,
+		SecureCookie: *secureCk,
 	})
 	if err != nil {
 		return err
 	}
 
+	// 日志器在配置合并之后构造：配置文件里写的 log_level 也要生效。
+	// 非法级别已在 config.Validate 中被拦截，这里不会静默降级。
+	logger, err := newLogger(bootstrap.Config.LogLevel)
+	if err != nil {
+		return err
+	}
+	slog.SetDefault(logger)
+	logBootstrap(logger, *configPath, bootstrap)
+
+	authenticator, err := buildAuthenticator(logger, bootstrap.Config, *configPath)
+	if err != nil {
+		return err
+	}
+
 	srv, err := server.New(server.Options{
-		Addr:      *addr,
+		Addr:      bootstrap.Config.Addr,
 		Logger:    logger,
 		Version:   version,
 		StaticDir: *staticDir,
@@ -140,47 +168,61 @@ func newLogger(level string) (*slog.Logger, error) {
 	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lv})), nil
 }
 
-// authOptions 汇总鉴权相关的启动参数。
-type authOptions struct {
-	user         string
-	password     string
-	passwordHash string
-	jwtSecret    string
-	ttl          time.Duration
-	secureCookie bool
+// logBootstrap 输出引导过程中的关键事件。
+//
+// 自动生成的密码只在这里出现一次：进程内只保留 bcrypt 哈希，
+// 配置文件里也只有哈希，因此必须显式提示用户立即保存。
+func logBootstrap(logger *slog.Logger, path string, res *config.BootstrapResult) {
+	switch {
+	case !res.Persistent:
+		logger.Warn("未指定 -config，本次运行不会持久化任何凭据",
+			"hint", "指定 -config /var/lib/lipanel/config.json 可自动生成并保存密码与密钥")
+	case res.Created:
+		logger.Info("已创建配置文件", "path", path)
+	case res.Saved:
+		logger.Info("已更新配置文件", "path", path)
+	default:
+		logger.Info("已加载配置文件", "path", path)
+	}
+
+	if res.PermissionWarning != "" {
+		logger.Warn("配置文件权限过于宽松", "detail", res.PermissionWarning)
+	}
+
+	// 自动生成的密码：唯一一次明文展示机会。
+	if p := res.GeneratedPassword; p != "" {
+		logger.Warn("已自动生成管理员密码，请立即抄录保存（此密码不会再显示）",
+			"username", res.Config.Auth.Username,
+			"password", p,
+			"hint", "如需自定义，可停止服务后用 -admin-password 重新指定",
+		)
+	}
+	if res.GeneratedSecret {
+		logger.Info("已自动生成 JWT 签名密钥并写入配置文件，重启后登录状态可保持",
+			"path", path)
+	}
+	if res.PasswordRotated {
+		logger.Info("管理员密码已按启动参数更新", "username", res.Config.Auth.Username)
+	}
+	if res.SecretRotated {
+		logger.Warn("JWT 签名密钥已按启动参数更新，此前签发的所有会话立即失效")
+	}
 }
 
-// buildAuthenticator 依据启动参数构造鉴权组件。
+// buildAuthenticator 依据最终配置构造鉴权组件。
 //
-// 密码来源优先级：-admin-password-hash > -admin-password > 开发默认口令。
-// 明文密码在这里立即转为 bcrypt 哈希，之后进程内只保留哈希，
-// 避免明文常驻内存（明文仍会短暂出现在命令行参数中，生产环境建议用哈希形式）。
-func buildAuthenticator(logger *slog.Logger, o authOptions) (*auth.Authenticator, error) {
-	username := strings.TrimSpace(o.user)
+// 凭据来源已在 config.Bootstrap 中统一解析（CLI > 配置文件 > 自动生成），
+// 这里只负责把结果转成 Authenticator，并处理「纯内存模式」的兜底逻辑。
+func buildAuthenticator(logger *slog.Logger, cfg *config.Config, configPath string) (*auth.Authenticator, error) {
+	username := strings.TrimSpace(cfg.Auth.Username)
 	if username == "" {
 		return nil, errors.New("管理员用户名不能为空")
 	}
 
-	var hash string
-	switch {
-	case o.passwordHash != "":
-		if !auth.IsBcryptHash(o.passwordHash) {
-			return nil, errors.New("-admin-password-hash 不是合法的 bcrypt 哈希（应以 $2a$/$2b$ 开头、共 60 字符）")
-		}
-		hash = o.passwordHash
-
-	case o.password != "":
-		if len([]rune(o.password)) < auth.MinPasswordLength {
-			return nil, fmt.Errorf("管理员密码过短，至少需要 %d 个字符", auth.MinPasswordLength)
-		}
-		h, err := auth.HashPassword(o.password)
-		if err != nil {
-			return nil, err
-		}
-		hash = h
-
-	default:
-		// 未配置密码：使用开发默认口令，并打印醒目告警。
+	hash := cfg.Auth.PasswordHash
+	if hash == "" {
+		// 走到这里说明既没有配置文件、也没有通过 CLI 指定密码，
+		// 属于本地开发的纯内存模式：退回默认口令并打印醒目告警。
 		h, err := auth.HashPassword(defaultDevPassword)
 		if err != nil {
 			return nil, err
@@ -189,7 +231,7 @@ func buildAuthenticator(logger *slog.Logger, o authOptions) (*auth.Authenticator
 		logger.Warn("未配置管理员密码，正在使用开发默认口令",
 			"username", username,
 			"password", defaultDevPassword,
-			"hint", "生产环境请使用 -admin-password 或 -admin-password-hash 指定",
+			"hint", "生产环境请指定 -config，或用 -admin-password / -admin-password-hash 传入",
 		)
 	}
 
@@ -198,29 +240,33 @@ func buildAuthenticator(logger *slog.Logger, o authOptions) (*auth.Authenticator
 		return nil, err
 	}
 
-	secret := []byte(o.jwtSecret)
+	ttl := cfg.TokenTTLDurationOrDefault()
 	authenticator, err := auth.New(auth.Options{
 		Store:        store,
-		Secret:       secret,
-		TTL:          o.ttl,
-		SecureCookie: o.secureCookie,
+		Secret:       []byte(cfg.Auth.JWTSecret),
+		TTL:          ttl,
+		SecureCookie: cfg.SecureCookie,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	if o.jwtSecret == "" {
+	if cfg.Auth.JWTSecret == "" {
 		logger.Warn("未配置 JWT 签名密钥，已随机生成；进程重启后所有登录会话将失效",
-			"hint", "可用 lipanel -gen-secret 生成一个固定密钥",
+			"hint", "指定 -config 可自动生成并持久化密钥，或用 -gen-secret 生成后写入配置",
 		)
 	}
-	if !o.secureCookie {
-		logger.Info("会话 Cookie 未启用 Secure 标记（当前假设通过 localhost 或受信内网访问）",
+	if !cfg.SecureCookie {
+		logger.Debug("会话 Cookie 未启用 Secure 标记",
 			"hint", "若已配置 HTTPS 反向代理，请加上 -secure-cookie",
 		)
 	}
 
-	logger.Info("管理员账号已就绪", "username", username, "token_ttl", authenticator.TTL().String())
+	logger.Info("管理员账号已就绪",
+		"username", username,
+		"token_ttl", authenticator.TTL().String(),
+		"persistent", configPath != "",
+	)
 	return authenticator, nil
 }
 

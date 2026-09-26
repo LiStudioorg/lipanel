@@ -26,6 +26,10 @@ const (
 
 	// SecretSize 是自动生成密钥的字节数（HS256 要求 ≥ 32 字节）。
 	SecretSize = 32
+
+	// MinSecretLength 是外部传入签名密钥的最小长度。
+	// HS256 的安全性直接取决于密钥长度，过短等同于没有签名。
+	MinSecretLength = 16
 )
 
 // Authenticator 负责签发与校验会话 token，并作为鉴权中间件的载体。
@@ -67,9 +71,9 @@ func New(opts Options) (*Authenticator, error) {
 		secret = buf
 		generated = true
 	}
-	if len(secret) < 16 {
+	if len(secret) < MinSecretLength {
 		// HS256 的安全性直接取决于密钥长度，过短等同于没有签名。
-		return nil, fmt.Errorf("auth: 签名密钥过短（%d 字节），至少需要 16 字节", len(secret))
+		return nil, fmt.Errorf("auth: 签名密钥过短（%d 字节），至少需要 %d 字节", len(secret), MinSecretLength)
 	}
 
 	ttl := opts.TTL

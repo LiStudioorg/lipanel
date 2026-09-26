@@ -8,6 +8,7 @@
 package auth
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 
@@ -22,6 +23,33 @@ const BcryptCost = 10
 // MinPasswordLength 是启动时对明文密码的最低长度要求。
 // 面板暴露在公网时弱口令是最大的风险来源，因此在入口处直接拒绝。
 const MinPasswordLength = 6
+
+// GeneratedPasswordLength 是首次启动自动生成的管理员密码长度。
+// 20 个字符取自 58 字符表，熵约 117 bit，足以抵抗离线爆破。
+const GeneratedPasswordLength = 20
+
+// passwordAlphabet 刻意剔除易混淆字符（0/O、1/l/I），
+// 因为自动生成的密码需要管理员从日志里手工抄写一次。
+const passwordAlphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+// GeneratePassword 生成一个高熵随机密码，用于首次启动的自动初始化。
+//
+// 使用 crypto/rand 而非 math/rand：后者是可预测的伪随机数，
+// 用它生成凭据等同于没有凭据。
+func GeneratePassword() (string, error) {
+	buf := make([]byte, GeneratedPasswordLength)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("auth: 生成随机密码失败: %w", err)
+	}
+
+	// 取模会引入极轻微偏斜（256 % 58 != 0），但对 20 字符的登录口令而言
+	// 影响可以忽略；这里优先保证代码简单可读。
+	out := make([]byte, len(buf))
+	for i, b := range buf {
+		out[i] = passwordAlphabet[int(b)%len(passwordAlphabet)]
+	}
+	return string(out), nil
+}
 
 // HashPassword 将明文密码转换为 bcrypt 哈希。
 // 返回值可直接持久化（阶段 2.6 的配置文件会用到）。

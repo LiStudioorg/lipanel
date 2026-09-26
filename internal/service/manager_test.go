@@ -550,6 +550,253 @@ func TestParseUnitFileList(t *testing.T) {
 	}
 }
 
+// TestListDropsUnloadableUnits 是本阶段第二个真实缺陷的回归测试。
+//
+// 缺陷描述：list-unit-files 会把**不可载入**的单元文件也列出来
+// （LoadState=not-found，例如发行版预置但未安装的 firewalld.service），
+// 实测本机 182 条里有 27 条属于此类。把它们展示给用户是有害的：
+// 用户点「启动」必然失败，而服务名看起来完全正常，无从判断原因。
+//
+// 修复：对仅来自 list-unit-files 的候选批量查 LoadState，剔除 not-found。
+func TestListDropsUnloadableUnits(t *testing.T) {
+	ex := &fakeExecutor{
+		handler: func(args []string) (string, string, error) {
+			joined := strings.Join(args, " ")
+			switch {
+			case strings.Contains(joined, "list-unit-files"):
+				return `  nginx.service        enabled
+  firewalld.service    disabled
+  auditd.service       disabled
+`, "", nil
+			case strings.Contains(joined, "list-units"):
+				// 只有 nginx 真正载入。
+				return "  nginx.service loaded active running Web server\n", "", nil
+			case strings.Contains(joined, "show"):
+				// 批量可载入性查询：firewalld/auditd 都是 not-found。
+				return "Id=firewalld.service\nLoadState=not-found\n\n" +
+					"Id=auditd.service\nLoadState=not-found\n", "", nil
+			}
+			return "", "", nil
+		},
+	}
+	m := newTestManager(t, ex)
+
+	list, err := m.List(context.Background())
+	if err != nil {
+		t.Fatalf("List 失败: %v", err)
+	}
+
+	names := make([]string, 0, len(list))
+	for _, s := range list {
+		names = append(names, s.Name)
+	}
+	if len(names) != 1 || names[0] != "nginx.service" {
+		t.Errorf("列表 = %v，期望只剩 [nginx.service]（幽灵单元应被剔除）", names)
+	}
+}
+
+// TestListKeepsUnitsWhenLoadabilityProbeFails 断言校验失败时**不阻断列表**：
+// 宁可多显示几个条目，也不能因为一次查询失败就让服务管理页打不开。
+func TestListKeepsUnitsWhenLoadabilityProbeFails(t *testing.T) {
+	ex := &fakeExecutor{
+		handler: func(args []string) (string, string, error) {
+			joined := strings.Join(args, " ")
+			switch {
+			case strings.Contains(joined, "list-unit-files"):
+				return "  nginx.service enabled\n", "", nil
+			case strings.Contains(joined, "list-units"):
+				return "", "", nil // 没有任何已载入单元
+			case strings.Contains(joined, "show"):
+				return "", "some failure", errors.New("exit status 1")
+			}
+			return "", "", nil
+		},
+	}
+	m := newTestManager(t, ex)
+
+	list, err := m.List(context.Background())
+	if err != nil {
+		t.Fatalf("校验失败时 List 不该报错: %v", err)
+	}
+	if len(list) != 1 {
+		t.Errorf("列表长度 = %d，期望 1（校验失败时应保留条目）", len(list))
+	}
+}
+
+// TestFilterUnloadableParsesBlocks 单测批量解析逻辑：
+// 输出以空行分段，字段顺序不作为契约。
+func TestFilterUnloadableParsesBlocks(t *testing.T) {
+	ex := &fakeExecutor{
+		handler: func([]string) (string, string, error) {
+			// 刻意让 LoadState 出现在 Id 之前，验证解析不依赖字段顺序。
+			return "LoadState=not-found\nId=ghost.service\n\n" +
+				"Id=real.service\nLoadState=loaded\n", "", nil
+		},
+	}
+	m := newTestManager(t, ex)
+
+	got, err := m.filterUnloadable(context.Background(), []string{"ghost.service", "real.service"})
+	if err != nil {
+		t.Fatalf("filterUnloadable 失败: %v", err)
+	}
+	if _, ok := got["ghost.service"]; !ok {
+		t.Error("ghost.service（not-found）应被识别为不可载入")
+	}
+	if _, ok := got["real.service"]; ok {
+		t.Error("real.service（loaded）不该被识别为不可载入")
+	}
+}
+
+// TestListDropsUnitsReportedNotFoundByListUnits 是实测发现的第二个根因的回归测试。
+//
+// 缺陷描述（比上一个更隐蔽）：`list-units --all` **也会**列出不可载入的单元，
+// 且 LOAD 列明确写着 not-found：
+//
+//	$ systemctl list-units --type=service --all
+//	firewalld.service   not-found inactive dead   firewalld.service
+//
+// 最初我按「来自 list-units 就必然是真实单元」跳过校验，
+// 结果这些幽灵单元照样留在列表里（实测 27 个只滤掉 10 个）。
+// 正确判据只有一个：LoadState 是否为 not-found——与数据来源无关。
+func TestListDropsUnitsReportedNotFoundByListUnits(t *testing.T) {
+	ex := &fakeExecutor{
+		handler: func(args []string) (string, string, error) {
+			joined := strings.Join(args, " ")
+			switch {
+			case strings.Contains(joined, "list-unit-files"):
+				return "  cron.service enabled\n  firewalld.service disabled\n", "", nil
+			case strings.Contains(joined, "list-units"):
+				// 关键：幽灵单元出现在 list-units 里，但 LOAD=not-found。
+				return "  cron.service        loaded    active   running Cron\n" +
+					"  firewalld.service   not-found inactive dead    firewalld.service\n", "", nil
+			case strings.Contains(joined, "show"):
+				return "Id=firewalld.service\nLoadState=not-found\n", "", nil
+			}
+			return "", "", nil
+		},
+	}
+	m := newTestManager(t, ex)
+
+	list, err := m.List(context.Background())
+	if err != nil {
+		t.Fatalf("List 失败: %v", err)
+	}
+	names := make([]string, 0, len(list))
+	for _, s := range list {
+		names = append(names, s.Name)
+	}
+	if len(names) != 1 || names[0] != "cron.service" {
+		t.Errorf("列表 = %v，期望只剩 [cron.service]（LOAD=not-found 的幽灵应被剔除）", names)
+	}
+}
+
+// TestListDropsTemplateUnits 断言模板单元（foo@.service）被剔除。
+//
+// 模板没有实例就无法启动，属于「不可操作」的单元；
+// 而且实测把模板名传给 `systemctl show` 会让**整批**查询失败
+// （"neither a valid invocation ID nor unit name"），
+// 因此必须在批量查询前就分流出去。
+func TestListDropsTemplateUnits(t *testing.T) {
+	ex := &fakeExecutor{
+		handler: func(args []string) (string, string, error) {
+			joined := strings.Join(args, " ")
+			switch {
+			case strings.Contains(joined, "list-unit-files"):
+				return "  cron.service enabled\n  modprobe@.service static\n", "", nil
+			case strings.Contains(joined, "list-units"):
+				return "  cron.service loaded active running Cron\n", "", nil
+			case strings.Contains(joined, "show"):
+				// 若模板名被传进来，systemctl 会整批失败——模拟这一点。
+				if strings.Contains(joined, "modprobe@.service") {
+					return "", "Failed to get properties: Unit name modprobe@.service is neither a valid invocation ID nor unit name.", errors.New("exit status 1")
+				}
+				return "Id=cron.service\nLoadState=loaded\n", "", nil
+			}
+			return "", "", nil
+		},
+	}
+	m := newTestManager(t, ex)
+
+	list, err := m.List(context.Background())
+	if err != nil {
+		t.Fatalf("List 失败: %v", err)
+	}
+	for _, s := range list {
+		if s.Name == "modprobe@.service" {
+			t.Error("模板单元 modprobe@.service 不该出现在列表中（无实例不可启动）")
+		}
+	}
+}
+
+// TestIsTemplateUnit 单测模板判定。
+func TestIsTemplateUnit(t *testing.T) {
+	templates := []string{"modprobe@.service", "getty@.service", "foo@.service"}
+	for _, n := range templates {
+		if !isTemplateUnit(n) {
+			t.Errorf("isTemplateUnit(%q) = false，期望 true", n)
+		}
+	}
+	// 实例化的单元不是模板，必须保留。
+	instances := []string{"getty@tty1.service", "user@1000.service", "cron.service", "nginx.service"}
+	for _, n := range instances {
+		if isTemplateUnit(n) {
+			t.Errorf("isTemplateUnit(%q) = true，期望 false（它是实例，可以操作）", n)
+		}
+	}
+}
+
+// TestFilterUnloadableExcludesTemplatesFromQuery 断言模板单元不会被传给 systemctl：
+// 只要传了，整批查询就会失败（这是实测的 systemd 行为）。
+func TestFilterUnloadableExcludesTemplatesFromQuery(t *testing.T) {
+	var queried []string
+	ex := &fakeExecutor{
+		handler: func(args []string) (string, string, error) {
+			// 记录真正被查询的名字（"--" 之后的全部参数）。
+			for i, a := range args {
+				if a == "--" {
+					queried = append(queried, args[i+1:]...)
+					break
+				}
+			}
+			return "Id=real.service\nLoadState=loaded\n", "", nil
+		},
+	}
+	m := newTestManager(t, ex)
+
+	got, err := m.filterUnloadable(context.Background(), []string{"real.service", "tpl@.service"})
+	if err != nil {
+		t.Fatalf("filterUnloadable 失败: %v", err)
+	}
+	for _, q := range queried {
+		if q == "tpl@.service" {
+			t.Error("模板单元被传给了 systemctl，会让整批查询失败")
+		}
+	}
+	if _, ok := got["tpl@.service"]; !ok {
+		t.Error("模板单元应被直接判为不可载入")
+	}
+}
+
+// TestFilterUnloadableKeepsPartialOutputOnError 断言批量查询报错时
+// 仍解析已拿到的部分输出（systemctl 会先输出有效段再报错）。
+func TestFilterUnloadableKeepsPartialOutputOnError(t *testing.T) {
+	ex := &fakeExecutor{
+		handler: func([]string) (string, string, error) {
+			// 有输出但退出码非 0：这是实测的真实行为。
+			return "Id=ghost.service\nLoadState=not-found\n", "some failure", errors.New("exit status 1")
+		},
+	}
+	m := newTestManager(t, ex)
+
+	got, err := m.filterUnloadable(context.Background(), []string{"ghost.service"})
+	if err != nil {
+		t.Fatalf("有部分输出时不该返回错误: %v", err)
+	}
+	if _, ok := got["ghost.service"]; !ok {
+		t.Error("应解析出部分输出中的 not-found 条目")
+	}
+}
+
 func TestListIsSorted(t *testing.T) {
 	ex := &fakeExecutor{
 		handler: func(args []string) (string, string, error) {

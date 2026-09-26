@@ -436,13 +436,173 @@ func (m *Manager) List(ctx context.Context) ([]Service, error) {
 		byName[s.Name] = s
 	}
 
-	// 3. 收集并按名称排序。
-	filtered := make([]Service, 0, len(order))
-	for _, name := range order {
-		filtered = append(filtered, byName[name])
+	// 3. 剔除「无法载入」的幽灵单元（实测发现的真实数据质量问题）。
+	//
+	// list-unit-files 会把一些**不可载入**的单元文件也列出来，
+	// 它们的 LoadState=not-found，启动必然失败：
+	//
+	//	$ systemctl start firewalld.service
+	//	Failed to start firewalld.service: Unit firewalld.service not found.
+	//
+	// 实测本机 182 个条目里有 27 个属于这种情况（firewalld、connman、
+	// auditd 等由发行版预置但未安装的单元文件）。把它们展示给用户是有害的：
+	// 用户会点「启动」，然后失败，却不知道为什么——
+	// 因为服务名看起来完全正常。
+	//
+	// 判定方式：**只信 LoadState**，不区分条目来自哪个数据源。
+	//
+	// 这里有个反直觉的实测结论：`list-units --all` 也会列出不可载入的单元，
+	// 且 LOAD 列明确写着 `not-found`：
+	//
+	//	$ systemctl list-units --type=service --all
+	//	firewalld.service   not-found inactive dead   firewalld.service
+	//
+	// 最初我按「来自 list-units 就必然是真实单元」来跳过校验，
+	// 结果这些幽灵单元照样留在列表里（实测 27 个只滤掉 10 个）。
+	// 正确的判据只有一个：LoadState 是否为 not-found。
+	//
+	// 因此对**所有** LoadState != "loaded" 的条目做批量确认，
+	// 已确认 loaded 的（list-units 给出的实时单元）无需再查。
+	// 批量查询只付一次进程启动成本，不随候选数量线性增长。
+	live := liveNames(unitsOut)
+	toVerify := make([]string, 0, len(byName))
+	for name, s := range byName {
+		if _, isLive := live[name]; isLive && s.LoadState == "loaded" {
+			// list-units 确认它真实存在（LOAD=loaded），无需再校验。
+			continue
+		}
+		toVerify = append(toVerify, name)
+	}
+
+	if len(toVerify) > 0 {
+		unloadable, err := m.filterUnloadable(ctx, toVerify)
+		if err != nil {
+			// 探测失败**不阻断列表**：宁可多显示几个幽灵单元，
+			// 也不能因为一次查询失败就让整个服务管理页打不开。
+			m.logger.Warn("无法校验服务可载入性，列表可能包含少量无效条目", "err", err)
+		} else {
+			for name := range unloadable {
+				delete(byName, name)
+			}
+		}
+	}
+
+	// 4. 收集并按名称排序。
+	filtered := make([]Service, 0, len(byName))
+	for _, s := range byName {
+		filtered = append(filtered, s)
 	}
 	sort.Slice(filtered, func(i, j int) bool { return filtered[i].Name < filtered[j].Name })
 	return filtered, nil
+}
+
+// liveNames 返回 list-units 输出中出现过的单元名集合。
+//
+// 单列一个函数是为了避免在多处重复解析（每次解析都要扫一遍全文）。
+func liveNames(unitsOut string) map[string]struct{} {
+	out := make(map[string]struct{}, 128)
+	for _, s := range parseUnitList(unitsOut) {
+		out[s.Name] = struct{}{}
+	}
+	return out
+}
+
+// filterUnloadable 返回给定单元中**不可载入**（LoadState=not-found）的那些。
+//
+// 两个实测踩到的坑，都不能靠"想当然"绕过：
+//
+//  1. **模板单元会让整批查询失败**（本次实测发现）。
+//     `systemctl show ... modprobe@.service` 直接报
+//     "Unit name modprobe@.service is neither a valid invocation ID nor unit name"
+//     并以非 0 退出——把这样一个名字混进批量参数里，**整批**都拿不到结果，
+//     导致过滤完全失效（表现为"过滤写了但毫无效果"）。
+//     因此这里先剔除模板单元（见 isTemplateUnit），再批量查询。
+//
+//  2. 批量查询返回非 0 时仍可能有**部分有效输出**（上面那次的输出里
+//     firewalld 的结果是完整的）。因此不能一遇错误就丢弃全部结果，
+//     而是解析已有输出、尽力而为。
+//
+// 模板单元本身（形如 foo@.service）**没有实例就无法启动**，
+// 因此直接视为不可载入——这既符合 systemd 语义，
+// 也顺带避免了上面第 1 个坑。
+func (m *Manager) filterUnloadable(ctx context.Context, names []string) (map[string]struct{}, error) {
+	unloadable := make(map[string]struct{})
+
+	// 先分流：模板单元直接判为不可载入，其余才送去批量查询。
+	queryable := make([]string, 0, len(names))
+	for _, n := range names {
+		if isTemplateUnit(n) {
+			unloadable[n] = struct{}{}
+			continue
+		}
+		queryable = append(queryable, n)
+	}
+	if len(queryable) == 0 {
+		return unloadable, nil
+	}
+
+	args := make([]string, 0, len(queryable)*2+8)
+	args = append(args, "show", "-p", "Id", "-p", "LoadState", "--")
+	args = append(args, queryable...)
+
+	out, err := m.run(ctx, listCommandTimeout, args...)
+	// 注意：err 非空也继续解析 out（见上方第 2 点）；
+	// 只有在完全没有输出时才把错误上抛给调用方去告警。
+	if err != nil && strings.TrimSpace(out) == "" {
+		return nil, err
+	}
+
+	// 解析：systemd 为每个单元输出一段，含 Id=... 与 LoadState=...，
+	// 段之间是空行。按空行切段后逐段读取两个字段，
+	// 比假设「字段顺序固定」更稳（顺序并非契约，实测中就有变化）。
+	var curID, curLoad string
+	flush := func() {
+		if curID != "" && curLoad == "not-found" {
+			unloadable[curID] = struct{}{}
+		}
+		curID, curLoad = "", ""
+	}
+
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			flush()
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "Id":
+			if curID != "" {
+				// 上一段没有以空行结束（输出末尾或异常情况），先结算。
+				flush()
+			}
+			curID = value
+		case "LoadState":
+			curLoad = value
+		}
+	}
+	flush()
+
+	// 若部分名字在输出里完全没出现（例如 batch 被某个坏名字中断），
+	// 无法判定其状态——保守起见**保留**它们（宁可多显示，不可误删）。
+	if err != nil {
+		m.logger.Warn("可载入性校验部分失败，未返回结果的条目将被保留",
+			"err", err, "queried", len(queryable), "resolved", len(unloadable))
+	}
+
+	return unloadable, nil
+}
+
+// isTemplateUnit 判断是否为 systemd 模板单元（形如 foo@.service）。
+//
+// 模板本身不是一个可启动的单元：必须用实例名（foo@bar.service）才能操作。
+// 实测 `systemctl show foo@.service` 会直接报
+// "neither a valid invocation ID nor unit name" 并失败。
+func isTemplateUnit(name string) bool {
+	return strings.HasSuffix(name, "@.service")
 }
 
 // parseUnitFileList 解析 systemctl list-unit-files 的输出。

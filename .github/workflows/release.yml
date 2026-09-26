@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '*' # 只要提交 tag 就触发，不限制格式
+
+permissions:
+  contents: write
+
+jobs:
+  # 第一步：只编译一次前端，作为产物传给后续所有架构复用
+  build-frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build Frontend
+        run: |
+          cd web
+          npm ci
+          npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+  # 第二步：调用 build.sh 编译 16 个平台，只产出裸二进制
+  build-binaries:
+    name: Build ${{ matrix.target.os }}-${{ matrix.target.arch }}
+    needs: build-frontend
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { os: windows, arch: 386 }
+          - { os: windows, arch: amd64 }
+          - { os: windows, arch: arm64 }
+          - { os: linux, arch: 386 }
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm }
+          - { os: linux, arch: arm64 }
+          - { os: linux, arch: loong64 }
+          - { os: linux, arch: mips }
+          - { os: linux, arch: mips64 }
+          - { os: linux, arch: mips64le }
+          - { os: linux, arch: mipsle }
+          - { os: linux, arch: ppc64 }
+          - { os: linux, arch: ppc64le }
+          - { os: linux, arch: riscv64 }
+          - { os: linux, arch: s390x }
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Build via build.sh
+        env:
+          GOOS: ${{ matrix.target.os }}
+          GOARCH: ${{ matrix.target.arch }}
+          VERSION: ${{ github.ref_name }}
+          SKIP_FRONTEND: '1' # 前端已在 build-frontend 里编译过了
+          PACK_TARBALL: '0'  # 不打包 tar.gz，只留裸二进制
+        run: |
+          chmod +x ./build.sh
+          ./build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lipanel-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          path: dist/*
+
+  # 第三步：收集并发布，只发裸二进制
+  publish:
+    name: Publish GitHub Release
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          # 只抓裸二进制文件（windows 带 .exe，linux 无后缀，全部匹配 lipanel_*）
+          files: |
+            dist/lipanel_*
+          generate_release_notes: true
+          draft: false

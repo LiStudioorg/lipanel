@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"embed"
 	"errors"
@@ -21,8 +22,11 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +34,7 @@ import (
 	"lipanel/internal/auth"
 	"lipanel/internal/config"
 	"lipanel/internal/file"
+	"lipanel/internal/firewall"
 	"lipanel/internal/plugin"
 	"lipanel/internal/server"
 	"lipanel/internal/service"
@@ -162,6 +167,30 @@ func run() error {
 		storeDryRun = flag.Bool("store-dry-run", false,
 			"试运行模式：只记录将要执行的命令，**不安装任何软件、不写任何系统文件**。"+
 				"用于在正式机器上先看清楚面板到底会做什么")
+
+		firewallBackend = flag.String("firewall-backend", "",
+			"强制指定防火墙后端（ufw / firewalld / nftables / iptables）；"+
+				"留空则按 ufw → firewalld → nftables → iptables 的优先级自动探测")
+		firewallTimeout = flag.Duration("firewall-timeout", firewall.DefaultCommandTimeout,
+			"单条防火墙命令的超时（默认 15s）。"+
+				"防火墙命令是瞬时完成的，超时说明多半是被 xtables lock 挡住了，"+
+				"因此不宜设置过长")
+		firewallPanelPort = flag.Int("firewall-panel-port", 0,
+			"面板自身的监听端口（用于「禁止误关」保护）；留空则从 -addr 自动推导")
+		firewallSSHPorts = flag.String("firewall-ssh-ports", "",
+			"额外受保护的 SSH 端口，多个用逗号分隔（如 22,2222）；"+
+				"留空则从 sshd 配置、监听端口与当前 SSH 连接自动探测。"+
+				"**探测不到时不会猜测**——宁可标记为空，也不错误地保护一个无关端口")
+		firewallExtraPorts = flag.String("firewall-protected-ports", "",
+			"额外受保护的端口，多个用逗号分隔（如 3306,6379）；"+
+				"这些端口在面板上会被标记为受保护，删除需显式强制确认")
+		firewallNftTable = flag.String("firewall-nft-table", firewall.DefaultTable,
+			"nftables 使用的表名（默认 filter）")
+		firewallNftChain = flag.String("firewall-nft-chain", firewall.DefaultChain,
+			"nftables 与 iptables 使用的链名（默认 input）")
+		firewallDryRun = flag.Bool("firewall-dry-run", false,
+			"试运行模式：只记录将要执行的防火墙命令，**不修改任何防火墙规则**。"+
+				"用于在正式机器上先看清楚面板到底会做什么（防火墙误操作可能导致失联）")
 	)
 	flag.Parse()
 
@@ -595,6 +624,150 @@ func run() error {
 			"reason", storeManager.UnavailableReason())
 	}
 
+	// ---------------------------------------------------------------------
+	// 防火墙与端口管理（阶段四 4.6，核心自带）
+	// ---------------------------------------------------------------------
+	//
+	// ########## 本模块与其它五个核心模块最本质的区别 ##########
+	//
+	// 防火墙操作的后果是**不可逆的失联风险**：
+	//
+	//	4.1 启停服务   —— 影响一个服务
+	//	4.2 读写文件   —— 影响若干文件
+	//	4.3 改站点配置 —— 影响 nginx 的加载行为
+	//	4.4 申请证书   —— 影响 HTTPS 与 CA 配额
+	//	4.5 安装软件   —— 影响系统软件构成
+	//	4.6 改防火墙   —— **影响这台机器能否被访问到**
+	//
+	// 一条错误的规则可以让 SSH 与面板**同时失联**，
+	// 用户只能通过物理控制台或云服务商的控制台恢复——
+	// 而这件事无法通过网络修好。因此本模块在启动阶段就把
+	// 三道保护配齐：端口保护、删除二次确认、不可精确删除即拒绝。
+	//
+	// 启动时不做任何防火墙写操作：只探测后端（全部是只读命令）。
+	// 真正需要用户显式触发的操作（放行/删除）都在接口层，
+	// 且必须带权限判定与审计。
+	firewallAuditor, err := firewall.NewAuditor(firewall.AuditOptions{
+		Capacity: *pluginAuditBuf,
+		Path:     *pluginAuditLog,
+		Logger:   logger,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = firewallAuditor.Close() }()
+
+	// 面板自身的监听端口：用于「禁止误关」保护。
+	//
+	// 从 -addr 推导而不是让用户必须再传一次 -firewall-panel-port：
+	// 面板端口是启动参数的一部分，重复配置只会带来不一致
+	// （用户在 -addr 改了端口却忘了改保护端口，保护就失效了）。
+	panelPort := *firewallPanelPort
+	if panelPort == 0 {
+		panelPort = portFromAddr(bootstrap.Config.Addr)
+	}
+
+	// 额外受保护的端口。
+	extraPorts := parsePortList(*firewallExtraPorts)
+
+	// SSH 端口：默认由 sshd 配置 / 监听端口 / 当前 SSH 连接自动探测。
+	//
+	// ########## 探测不到时绝不猜测 ##########
+	//
+	// 若猜 SSH 是 22 而实际是 2222，会有两个后果：
+	//	· 真正的 2222 没被保护，用户关掉它就失联（安全事故）
+	//	· 无关的 22 被"保护"，用户被错误拦下（信任损失）
+	// 因此探测失败时返回空集合，由前端如实显示"未能确定 SSH 端口"。
+	sshPorts := parsePortList(*firewallSSHPorts)
+	protectOpts := firewall.ProtectOptions{
+		PanelPort:      panelPort,
+		ExtraPorts:     append(extraPorts, sshPorts...),
+		SSHConfigPaths: firewall.DefaultSSHConfigPaths,
+	}
+	if *firewallSSHPorts == "" {
+		// 显式指定了 SSH 端口时就不再探测（用户说了算）；
+		// 否则用监听端口探测作为配置之外的补充手段。
+		protectOpts.SSHListenProbe = detectSSHListenPorts
+		protectOpts.SSHConnectionEnv = os.Getenv("SSH_CONNECTION")
+	}
+
+	firewallDetector := firewall.NewDetector(firewall.DetectOptions{
+		ForceBackend: *firewallBackend,
+		Table:        *firewallNftTable,
+		Chain:        *firewallNftChain,
+	})
+
+	// 端到端验证用的假执行器（见 internal/firewall/fake.go）。
+	//
+	// ########## 它为什么必须存在 ##########
+	//
+	// 本模块的写操作会真实修改系统防火墙，而一条错误的规则
+	// 能让用户同时失去 SSH 与面板——且无法远程修复。
+	// 要在"HTTP → 权限 → 审计 → 命令组装 → 执行"这条完整链路上
+	// 做验证，就必须有一个不会碰真防火墙的执行器。
+	//
+	// 它只在环境变量 LIPANEL_FIREWALL_FAKE 被显式设置时生效，
+	// 且启用时会打印醒目的 WARN——绝不可能"默认开启"。
+	firewallExec, fakeExecutor := firewall.FakeExecutorFromEnv()
+	if fakeExecutor {
+		logger.Warn("⚠️  防火墙使用【假执行器】：所有命令都不会真正执行，"+
+			"仅用于端到端验证。生产环境绝不能设置 "+firewall.FakeExecutorEnv,
+			"env", firewall.FakeExecutorEnv)
+		// 探测也必须走假执行器，否则会选中真实后端并与假数据对不上。
+		firewallDetector = firewall.NewDetector(firewall.DetectOptions{
+			Executor:     firewallExec,
+			ForceBackend: *firewallBackend,
+			Table:        *firewallNftTable,
+			Chain:        *firewallNftChain,
+		})
+	}
+
+	firewallManager, err := firewall.NewManager(firewall.Options{
+		Logger:         logger,
+		Executor:       firewallExec,
+		Auditor:        firewallAuditor,
+		Detector:       firewallDetector,
+		Protector:      firewall.NewProtector(protectOpts),
+		CommandTimeout: *firewallTimeout,
+		DryRun:         *firewallDryRun,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化防火墙管理失败: %w", err)
+	}
+
+	// 启动时做一次只读探测并打印结论。
+	//
+	// 探测失败**不阻断启动**——面板其它功能必须照常可用
+	// （与 4.1 无 systemd、4.3 无 nginx、4.5 无包管理器的降级策略一致）。
+	if det, derr := firewallManager.Detect(bootstrapCtx(), false); derr == nil {
+		if det.Available {
+			logger.Info("防火墙管理已就绪",
+				"backend", det.Label,
+				"active", det.Active,
+				"available", det.Available)
+			for _, note := range det.Notes {
+				logger.Info("防火墙提示", "note", note)
+			}
+			if !det.Active {
+				logger.Warn("检测到防火墙已安装但未启用，面板上的规则不会生效",
+					"backend", det.Label)
+			}
+		} else {
+			logger.Warn("未检测到可用的防火墙，面板其它功能不受影响",
+				"reason", det.Reason)
+		}
+	}
+	if *firewallDryRun {
+		logger.Warn("防火墙处于试运行模式（-firewall-dry-run）：" +
+			"不会修改任何防火墙规则，只记录将要执行的命令")
+	}
+	if panelPort > 0 {
+		logger.Info("防火墙端口保护已启用",
+			"panel_port", panelPort,
+			"extra_protected", extraPorts,
+			"ssh_ports_explicit", sshPorts)
+	}
+
 	// 注入内嵌前端资源（go:embed 在根目录，见本文件顶部 distFS）。
 	// 仅在没有用 -static-dir 覆盖时才需要解析；解析失败属构建错误，直接终止。
 	var (
@@ -626,6 +799,7 @@ func run() error {
 		// 而状态接口需要在它不存在时也能正常返回。
 		SSLScheduler: sslScheduler,
 		Store:        storeManager,
+		Firewall:     firewallManager,
 	})
 	if err != nil {
 		return err
@@ -944,4 +1118,250 @@ func (r *sslConfigRewriter) RemoveSSL(ctx context.Context, siteName string) erro
 		return fmt.Errorf("site: %w", err)
 	}
 	return nil
+}
+
+// ============================================================================
+// 防火墙模块的启动辅助（阶段四 4.6）
+// ============================================================================
+
+// portFromAddr 从监听地址解析出端口号。
+//
+// ########## 为什么解析失败要返回 0 而不是默认 8080 ##########
+//
+// 面板端口用于"禁止误关"保护。若解析失败时回退到一个猜测的端口，
+// 就会保护一个无关端口，而真正的面板端口毫无保护——
+// 用户关掉它之后**再也打不开面板**。
+//
+// 返回 0 表示"不知道"，保护逻辑会跳过面板端口保护，
+// 并在日志里明确告知——这比"保护错了端口"安全得多。
+func portFromAddr(addr string) int {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		// 兼容 "8080" 这种只有端口的写法。
+		if n, convErr := strconv.Atoi(strings.TrimSpace(addr)); convErr == nil {
+			if n > 0 && n <= 65535 {
+				return n
+			}
+		}
+		return 0
+	}
+	n, err := strconv.Atoi(portStr)
+	if err != nil || n <= 0 || n > 65535 {
+		return 0
+	}
+	return n
+}
+
+// parsePortList 解析逗号分隔的端口列表。
+//
+// 非法项被**跳过**而不是让启动失败：这些参数是"额外的保护措施"，
+// 写错一个不该让面板起不来（用户会被挡在门外，无从修正）。
+// 但每一项都会记日志，避免静默忽略。
+func parsePortList(raw string) []int {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var out []int
+	seen := map[int]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		s := strings.TrimSpace(part)
+		if s == "" {
+			continue
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil || n <= 0 || n > 65535 {
+			slog.Warn("忽略非法的端口参数项", "value", s,
+				"hint", "端口必须是 1-65535 之间的整数")
+			continue
+		}
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out
+}
+
+// detectSSHListenPorts 尝试探测 SSH 服务的监听端口。
+//
+// ########## 为什么用 /proc/net/tcp 而不是跑 ss/lsof ##########
+//
+// ① 不依赖外部命令（精简系统上 ss 可能没装，lsof 多数没有）；
+// ② ss -p 需要能读到进程信息，在受限环境里常常失败；
+// ③ 解析 /proc 是纯读文件，不会因为命令不存在而报错。
+//
+// ########## 关于"不猜" ##########
+//
+// 本函数只回答"SSH 在听哪个端口"，拿不到就返回 nil。
+// **绝不**在拿不到时返回 22 —— 那会让保护功能误保护一个
+// 无关端口，而真正的 SSH 端口毫无保护。
+//
+// 局限：/proc/net/tcp 不知道哪个进程在听，因此无法区分
+// "sshd 的监听"与"别的服务的监听"。为降低误报，这里
+// 只在**进程信息可得**时才采用该端口（见 /proc/<pid> 的
+// 遍历检查）；拿不到进程归属就返回 nil，交给
+// sshd_config 与 SSH_CONNECTION 两条路径。
+func detectSSHListenPorts(_ context.Context) []int {
+	ports := sshdListenPortsFromProc()
+	if len(ports) == 0 {
+		return nil
+	}
+	return ports
+}
+
+// sshdListenPortsFromProc 遍历 /proc 找出 sshd 进程的监听端口。
+//
+// 实现方式：
+//
+//	① 从 /proc/net/tcp 与 /proc/net/tcp6 收集全部 LISTEN 状态的本地端口；
+//	② 遍历 /proc/<pid>/comm 找名为 sshd 的进程；
+//	③ 用该进程的 socket inode（/proc/<pid>/fd）与 ① 里的 inode 求交集。
+//
+// 第 ③ 步需要读 /proc/<pid>/fd，在权限不足时会失败——
+// 此时**返回 nil 而不是退化为"所有监听端口"**（那会保护一堆无关端口）。
+func sshdListenPortsFromProc() []int {
+	sshdInodes := sshdSocketInodes()
+	if len(sshdInodes) == 0 {
+		return nil
+	}
+
+	var ports []int
+	seen := map[int]bool{}
+	for _, file := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		for _, port := range listenPortsFromNetFile(file, sshdInodes) {
+			if !seen[port] {
+				seen[port] = true
+				ports = append(ports, port)
+			}
+		}
+	}
+	return ports
+}
+
+// sshdSocketInodes 返回 sshd 进程持有的 socket inode 集合。
+//
+// 用 /proc/<pid>/comm 判断进程名（比读 cmdline 便宜，
+// 且 comm 就是内核记录的进程名，sshd 的子进程同样叫 sshd）。
+func sshdSocketInodes() map[string]bool {
+	inodes := map[string]bool{}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue // 不是 pid 目录
+		}
+		commPath := filepath.Join("/proc", e.Name(), "comm")
+		comm, err := os.ReadFile(commPath)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(comm)) != "sshd" {
+			continue
+		}
+		// 该进程的 socket fd 指向 "socket:[<inode>]"。
+		fdDir := filepath.Join("/proc", e.Name(), "fd")
+		fds, err := os.ReadDir(fdDir)
+		if err != nil {
+			// 权限不足：无法确认端口归属。
+			// 直接返回 nil，绝不退化成"所有监听端口"。
+			continue
+		}
+		for _, fd := range fds {
+			link, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
+			if err != nil {
+				continue
+			}
+			if inode, ok := parseSocketInode(link); ok {
+				inodes[inode] = true
+			}
+		}
+	}
+	if len(inodes) == 0 {
+		return nil
+	}
+	return inodes
+}
+
+// parseSocketInode 从 "socket:[12345]" 解析出 inode 字符串。
+func parseSocketInode(link string) (string, bool) {
+	const prefix = "socket:["
+	if !strings.HasPrefix(link, prefix) || !strings.HasSuffix(link, "]") {
+		return "", false
+	}
+	return link[len(prefix) : len(link)-1], true
+}
+
+// listenPortsFromNetFile 从 /proc/net/tcp(6) 里提取处于 LISTEN 状态、
+// 且 inode 属于目标集合的本地端口。
+//
+// ########## 该文件的格式 ##########
+//
+//	sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+//	0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 ...
+//
+// local_address 是 "十六进制IP:十六进制端口"，端口需要按 16 进制解析。
+// st（状态）为 0A 表示 LISTEN。
+const tcpListenState = "0A"
+
+func listenPortsFromNetFile(path string, inodes map[string]bool) []int {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var ports []int
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	first := true
+	for scanner.Scan() {
+		if first {
+			first = false // 跳过表头
+			continue
+		}
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 10 {
+			continue
+		}
+		// fields[1] = local_address, fields[3] = st, fields[9] = inode
+		if fields[3] != tcpListenState {
+			continue
+		}
+		if !inodes[fields[9]] {
+			continue
+		}
+		_, portHex, ok := strings.Cut(fields[1], ":")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseInt(portHex, 16, 32)
+		if err != nil || n <= 0 || n > 65535 {
+			continue
+		}
+		ports = append(ports, int(n))
+	}
+	return ports
+}
+
+// bootstrapCtx 返回一个用于启动期探测的短超时上下文。
+//
+// 启动探测必须**有界**：若某个防火墙命令卡住（例如
+// 被 xtables lock 挡住），面板不能因此起不来——
+// 用户会看到一个永远不启动的进程，且无从判断原因。
+func bootstrapCtx() context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 启动探测只需要在这几秒内完成，之后 ctx 无需保留：
+	// 调用方只用它跑一次同步探测，因此这里不返回 cancel
+	// （太早 cancel 会让探测立刻失败）。
+	go func() {
+		time.Sleep(10 * time.Second)
+		cancel()
+	}()
+	return ctx
 }

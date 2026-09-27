@@ -17,6 +17,7 @@ import (
 
 	"lipanel/internal/auth"
 	"lipanel/internal/file"
+	"lipanel/internal/firewall"
 	"lipanel/internal/plugin"
 	"lipanel/internal/service"
 	"lipanel/internal/site"
@@ -90,6 +91,16 @@ type Options struct {
 	// 为 nil 时 /api/store 返回 503（而不是 panic）：
 	// 与 4.1~4.4 一致，只关心其它功能的测试无需构造它。
 	Store *store.Manager
+
+	// Firewall 是防火墙与端口管理器（阶段四 4.6，核心自带）。
+	//
+	// 为 nil 时 /api/firewall 返回 503（而不是 panic）：
+	// 与 4.1~4.5 一致，只关心其它功能的测试无需构造它。
+	//
+	// 与其它模块一样，"系统没装防火墙"不等于"接口不可用"：
+	// 那种情况下接口返回 200 且 available=false + 安装指引，
+	// 让前端能渲染出带原因的说明页而不是一个红色错误框。
+	Firewall *firewall.Manager
 }
 
 // Server 封装 HTTP 服务及其依赖。
@@ -106,6 +117,7 @@ type Server struct {
 	sslMgr       *ssl.Manager
 	sslScheduler *ssl.RenewScheduler
 	storeMgr     *store.Manager
+	firewallMgr  *firewall.Manager
 	handler      http.Handler
 	httpSrv      *http.Server
 }
@@ -162,6 +174,14 @@ func New(opts Options) (*Server, error) {
 
 	// 软件商店（阶段四 4.5）：同上。未注入时 /api/store 返回 503。
 	s.storeMgr = opts.Store
+
+	// 防火墙与端口管理（阶段四 4.6）：同上。未注入时 /api/firewall 返回 503。
+	//
+	// 特别注意：本模块的默认执行器会**真实修改系统防火墙**。
+	// 因此生产注入的是真实执行器，而测试与端到端验证
+	// 一律注入假执行器（见 internal/server/firewall_api_test.go
+	// 与 .e2e/run-firewall-e2e.sh）——绝不让测试碰宿主机防火墙。
+	s.firewallMgr = opts.Firewall
 
 	mux := http.NewServeMux()
 	// 服务路由由 registerAPIRoutes 内部统一注册（核心自带功能，

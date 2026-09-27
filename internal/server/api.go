@@ -67,6 +67,27 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// 注意：registerStoreRoutes 内部把 capabilities/audit/tasks 这些
 	// **固定段**路由放在 /{name}/... 通配之前注册，详见其注释。
 	s.registerStoreRoutes(mux)
+
+	// ---------- 防火墙与端口管理（阶段四 4.6，核心自带）----------
+	//
+	// 与 4.1~4.5 同一套架构：firewall_api.go 承载 handler，
+	// internal/firewall 承载后端探测、命令组装、规则解析、
+	// 端口保护、权限与审计。
+	//
+	// ########## 本模块的接口有两处与其它模块不同 ##########
+	//
+	//  ① 删除必须带 confirm —— 否则返回 **428 Precondition Required**。
+	//     计划明确要求"删除规则前必须二次确认，避免把 SSH 端口误关
+	//     导致失联"。前端弹窗只是体验，服务端强制才是边界。
+	//
+	//  ② 受保护端口（面板自身 / SSH）默认拒绝删除（409），
+	//     需要显式 force=true，且会被单独记入审计。
+	//
+	// 另外：本模块的写操作会**真实修改系统防火墙**，
+	// 而一条错误的规则可以让用户同时失去 SSH 与面板的访问
+	// （只能靠物理控制台恢复）。因此测试与端到端验证
+	// 一律注入假执行器，绝不碰宿主机防火墙。
+	s.registerFirewallRoutes(mux)
 }
 
 // healthResponse 是 /api/health 的响应体，字段使用 snake_case 以便前端直接消费。

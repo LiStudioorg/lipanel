@@ -136,8 +136,24 @@ type Descriptor struct {
 	// Description 是插件用途说明。
 	Description string `json:"description,omitempty"`
 	// Builtin 表示是否为内置插件（编译进主程序）。
-	// 本阶段只支持内置插件；外部插件安装能力留待后续。
+	//
+	// false 表示这是**外部插件**：元数据来自磁盘上的 descriptor.json，
+	// 前端资源来自插件目录而非 go:embed。前端据此显示"可卸载"等操作。
 	Builtin bool `json:"builtin"`
+	// External 表示该插件由外部插件机制加载（descriptor.json）。
+	//
+	// 与 Builtin 是互补的：Builtin=true 时 External 必为 false。
+	// 单独一个字段而不是只靠 !Builtin，是因为将来可能有
+	// "用户自己编译进去的插件"（Builtin=true 但不是官方内置）。
+	External bool `json:"external,omitempty"`
+	// Dir 是外部插件的根目录（绝对路径）；内置插件为空。
+	//
+	// ########## 这个字段不会出现在 API 响应里 ##########
+	//
+	// 它包含服务器上的绝对路径，属于部署细节。
+	// 前端拿到它没有任何用处，泄露出去只是白给信息。
+	// 因此用 json:"-" 而不是 omitempty。
+	Dir string `json:"-"`
 	// Mode 是运行模式，见 ModeManaged / ModeExternal。
 	Mode string `json:"mode"`
 	// Permissions 是插件声明的权限清单（阶段三 3.3）。

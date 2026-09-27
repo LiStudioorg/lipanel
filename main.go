@@ -111,6 +111,13 @@ func run() error {
 			"插件操作审计日志路径（JSONL，追加写入，权限 0600）；留空则审计只保留在内存中")
 		pluginAuditBuf = flag.Int("audit-buffer", plugin.DefaultAuditCapacity,
 			"插件操作审计在内存中保留的条数上限（供审计页查询）")
+		pluginDir = flag.String("plugin-dir", plugin.DefaultExternalDir,
+			"外部插件目录。面板启动时会扫描其下的子目录并加载 descriptor.json；"+
+				"也可以通过插件管理页上传 zip 包安装到这里。"+
+				"目录不存在时静默跳过（不启用外部插件）")
+		pluginNoExternal = flag.Bool("no-external-plugins", false,
+			"禁用外部插件：不扫描 -plugin-dir，也拒绝安装请求。"+
+				"用于在排查问题时排除外部插件的干扰")
 
 		serviceTimeout = flag.Duration("service-timeout", service.DefaultCommandTimeout,
 			"单个服务启停操作中每次 systemctl 调用的超时（如 30s、2m）")
@@ -264,10 +271,19 @@ func run() error {
 	}
 	defer func() { _ = auditor.Close() }()
 
+	// 外部插件目录：-no-external-plugins 时留空，
+	// 这样 Manager 的扫描与安装都自然降级为"未启用"，
+	// 不需要在后续逻辑里到处判断开关。
+	externalPluginDir := *pluginDir
+	if *pluginNoExternal {
+		externalPluginDir = ""
+	}
+
 	pluginManager, err := plugin.NewManager(plugin.Options{
 		SocketDir: *pluginSocketDir,
 		Logger:    logger,
 		Audit:     auditor,
+		PluginDir: externalPluginDir,
 	})
 	if err != nil {
 		return err
@@ -282,6 +298,44 @@ func run() error {
 		"audit_log", *pluginAuditLog,
 		"audit_buffer", *pluginAuditBuf,
 	)
+
+	// ########## 扫描并加载外部插件 ##########
+	//
+	// 放在内置插件注册**之后**：ID 冲突的判定需要知道内置插件
+	// 占用了哪些 ID。若反过来先扫外部插件，一个叫 "sysinfo" 的
+	// 外部插件会先注册成功，随后内置插件注册时才会冲突——
+	// 那时错误会指向"内置插件注册失败"，而真正该被拒绝的是外部插件。
+	//
+	// 本调用**不会**因为个别插件有问题而失败：加载失败的插件
+	// 记入 Failed 列表（可在插件管理页看到），面板照常启动。
+	// 理由见 LoadExternal 的说明——一个写错 manifest 的插件
+	// 不该让用户失去管理服务器的手段。
+	if externalPluginDir != "" {
+		loadRes, lerr := pluginManager.LoadExternal(externalPluginDir)
+		if lerr != nil {
+			// 这个错误只在"目录存在但读不了"时出现，不阻断启动。
+			logger.Warn("扫描外部插件目录时出错，面板其它功能不受影响",
+				"dir", externalPluginDir, "err", lerr)
+		} else if loadRes != nil {
+			if len(loadRes.Loaded) == 0 && len(loadRes.Failed) == 0 {
+				logger.Info("外部插件目录为空（这是正常的）", "dir", externalPluginDir)
+			}
+			// 失败的插件在 LoadExternal 内部已逐条记 WARN，
+			// 这里只汇总数量，避免日志重复。
+			if len(loadRes.Failed) > 0 {
+				logger.Warn("有外部插件加载失败，可在插件管理页查看原因",
+					"failed_count", len(loadRes.Failed))
+			}
+			if len(loadRes.Loaded) > 0 {
+				logger.Info("外部插件已加载（默认不自动启动）",
+					"count", len(loadRes.Loaded),
+					"plugins", loadRes.Loaded,
+					"hint", "带后端的插件需在插件管理页手动启动")
+			}
+		}
+	} else if *pluginNoExternal {
+		logger.Info("外部插件已禁用（-no-external-plugins）")
+	}
 
 	// 服务管理器（阶段四 4.1）。
 	//

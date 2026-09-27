@@ -48,7 +48,23 @@ func (s *Server) registerPluginRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/plugins/{id}/restart", s.auth.RequireAuth(http.HandlerFunc(s.handlePluginRestart)))
 	mux.Handle("POST /api/plugins/{id}/health", s.auth.RequireAuth(http.HandlerFunc(s.handlePluginHealth)))
 
-	// 审计接口（阶段三 3.3）。必须在 "/api/plugins/{id}/" 通配之前注册，
+	// ########## 插件安装（外部插件机制）##########
+	//
+	// 必须在这里注册——也就是在下面的 "/api/plugins/{id}/" 通配之前。
+	//
+	// ########## 为什么这条顺序是**硬性**的 ##########
+	//
+	// 若晚于通配注册，POST /api/plugins/install 会被匹配成
+	// "插件 ID = install 的子路径请求"（即 handlePluginProxy），
+	// 于是安装请求会被转发给一个根本不存在的插件进程，
+	// 用户得到的是 404「插件不存在」——一个与真实原因
+	// 毫无关系的错误。
+	//
+	// 这是本项目连续踩过六次的同一个坑（见 开发计划.md 已知坑位），
+	// plugin_install_api_test.go 里有专门用例锁死它。
+	mux.Handle("POST /api/plugins/install", s.auth.RequireAuth(http.HandlerFunc(s.handlePluginInstall)))
+
+	// 审计接口（阶段三 3.3）。同样必须在 "/api/plugins/{id}/" 通配之前注册，
 	// 否则 "/api/plugins/audit" 会被当成插件 ID = "audit" 的转发请求。
 	mux.Handle("GET /api/plugins/audit", s.auth.RequireAuth(http.HandlerFunc(s.handleAuditLog)))
 	mux.Handle("GET /api/plugins/{id}/audit", s.auth.RequireAuth(http.HandlerFunc(s.handlePluginAudit)))

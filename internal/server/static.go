@@ -68,6 +68,28 @@ func (s *Server) spaHandler(fsys fs.FS) http.Handler {
 			return
 		}
 
+		// ########## 外部插件的前端资源（必须在 SPA 兜底之前）##########
+		//
+		// 外部插件的资源在磁盘上（<pluginDir>/<id>/assets/），
+		// **不在**内嵌的 fsys 里，因此上面的 fs.Stat 一定不命中。
+		//
+		// 若不在这里拦截，请求会落到下面的 index.html 兜底——
+		// 浏览器拿到的是一段 HTML，却按 ESM 模块去解析，报出
+		//
+		//	Failed to load module script: Expected a JavaScript-or-Wasm
+		//	module script but the server responded with a MIME type of "text/html"
+		//
+		// 这正是本项目 v0.2.0 那次 P0 白屏的**同一个故障模式**
+		// （见 开发计划.md 坑位 64）。区别只是那次是构建产物里的
+		// runtime.js 被改坏，这次是路由没注册。
+		//
+		// 所以这道拦截的位置是**语义要求**，不是风格偏好：
+		// 它必须在 SPA 兜底之前。plugin_install_api_test.go 里有
+		// 一个专门用例锁死这个顺序。
+		if s.serveExternalPluginAsset(w, r) {
+			return
+		}
+
 		// 未命中：回退到 index.html，交给前端路由处理。
 		data, err := fs.ReadFile(fsys, "index.html")
 		if err != nil {

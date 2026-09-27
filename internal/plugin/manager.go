@@ -40,6 +40,11 @@ type Options struct {
 	// Audit 为 nil 时新建一个仅内存的审计器（容量 DefaultAuditCapacity）。
 	// 由 main 注入以支持 -audit-log 落盘；测试可注入自定义实例以断言记录内容。
 	Audit *Auditor
+	// PluginDir 是外部插件目录，由 -plugin-dir 指定。
+	//
+	// 为空表示不启用外部插件：扫描直接返回空结果，
+	// 安装接口返回明确的错误（而不是写到一个猜出来的默认路径）。
+	PluginDir string
 }
 
 // entry 是注册表中一个插件条目的运行时记录。
@@ -157,6 +162,13 @@ func (m *Manager) Close() error {
 // SocketDir 返回 socket 目录，便于日志与测试断言。
 func (m *Manager) SocketDir() string { return m.sockDir }
 
+// ExternalDir 返回外部插件目录（install 接口的落点）。
+//
+// 与 SocketDir 同样只读：目录由 main 通过 -plugin-dir 指定，
+// 运行期不允许改变（改了就意味着一部分插件在旧目录、
+// 一部分在新目录，注册表与实际磁盘会对不上）。
+func (m *Manager) ExternalDir() string { return m.opts.PluginDir }
+
 // RequestTimeout 返回转发请求的超时上限。
 func (m *Manager) RequestTimeout() time.Duration { return m.opts.RequestTimeout }
 
@@ -189,6 +201,20 @@ func (m *Manager) Register(desc Descriptor) error {
 	}
 	if desc.Mode == ModeManaged {
 		e.proc = newProcess(desc, e.sockPath, m.logger)
+
+		// ########## 外部插件的可执行文件在这里绑定 ##########
+		//
+		// 内置插件留空 execPath，走"主程序自身 + __plugin_<id> 子命令"。
+		// 外部插件带上自己的二进制路径与参数，由 process.Start 分支处理。
+		//
+		// 之所以在**注册时**就算好路径（而不是启动时现算）：
+		// 注册发生在启动扫描阶段，此时任何路径问题都能立刻
+		// 变成一条加载失败记录；而启动是用户手动触发的，
+		// 那时报错只能让用户重试，体验更差。
+		if desc.External {
+			e.proc.execPath = m.externalExecPath(&desc)
+			e.proc.execArgs = m.externalArgs(&desc)
+		}
 	}
 	m.registry[desc.ID] = e
 	m.order = append(m.order, desc.ID)

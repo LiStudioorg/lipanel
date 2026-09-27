@@ -146,7 +146,36 @@ func rebuildTestRoutes(s *Server) {
 	mux := http.NewServeMux()
 	s.registerAPIRoutes(mux)
 	s.registerPluginRoutes(mux)
-	s.handler = s.withRecovery(s.withRequestLog(s.withSPAFallback(mux)))
+
+	// ########## 必须注册**真实的** staticHandler，不能用替身 ##########
+	//
+	// 生产上（server.go 的 New）"/" 兜底挂的是 s.staticHandler()，
+	// 里面包含外部插件资源路由（serveExternalPluginAsset）。
+	//
+	// 本函数原先挂的是一个测试专用的 withSPAFallback 替身，它只实现
+	// "未命中 → HTML"。后果是**任何挂在 staticHandler 里的新逻辑都无法被测试覆盖**：
+	// 外部插件资源测试会走替身、返回 text/html，于是断言失败——
+	// 而失败的原因在替身，不在被测代码。更糟的情况是替身恰好"看起来能用"，
+	// 于是回归测试对真实代码毫无保护力。
+	//
+	// 因此这里改为直接调用生产的 staticHandler。若构造失败（例如
+	// WebFS 未注入），退回到替身以保证既有测试仍可运行。
+	if staticHandler, err := s.staticHandler(); err == nil {
+		mux.Handle("/", staticHandler)
+	} else {
+		mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/") {
+				writeJSON(w, s.logger, http.StatusNotFound, map[string]string{
+					"error": "接口不存在: " + r.URL.Path,
+				})
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<!doctype html>"))
+		}))
+	}
+
+	s.handler = s.withRecovery(s.withRequestLog(mux))
 }
 
 // withSPAFallback 给测试路由装上前端兜底。

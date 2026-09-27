@@ -39,6 +39,18 @@ type process struct {
 	// sockPath 是该插件监听的 Unix socket 路径。
 	sockPath string
 
+	// execPath 是外部插件自带可执行文件的绝对路径；内置插件为空。
+	//
+	// ########## 为空 = 走内置插件路径 ##########
+	//
+	// 空值表示"用主程序自身二进制 + __plugin_<id> 子命令"，
+	// 这正是内置插件的启动方式。两种形态在这里收敛成一个分支判断，
+	// 而不是拆成两个 process 类型——因为它们的生命周期管理
+	// （启动、等就绪、崩溃回收、整组终止）完全一致。
+	execPath string
+	// execArgs 是传给 execPath 的附加参数（仅外部插件使用）。
+	execArgs []string
+
 	logger *slog.Logger
 
 	mu        sync.Mutex
@@ -71,8 +83,18 @@ func newProcess(desc Descriptor, sockPath string, logger *slog.Logger) *process 
 
 // Start 拉起插件进程并等待其 socket 就绪，返回启动快照。
 //
-// 参数 binPath 是主程序自身的可执行文件路径：内置插件通过
-// 「自身二进制 + __plugin_<id> 子命令」的方式启动，因此不需要额外的可执行文件。
+// 参数 binPath 是**内置插件**的启动方式：主程序自身的可执行文件 +
+// __plugin_<id> 子命令（它们编译在主程序里，不需要额外文件）。
+//
+// ########## 外部插件的启动路径不同 ##########
+//
+// 外部插件自带可执行文件（见 p.execPath），它的代码不在主程序里，
+// 因此不能用「自身二进制 + 子命令」。若 p.execPath 非空，
+// 本函数直接 exec 那个文件，忽略 binPath。
+//
+// 两条路径共用本函数的其余全部逻辑（socket 准备、进程组、
+// 回收 goroutine、就绪等待），因为它们**的风险与需求完全相同**：
+// 都要等 socket 就绪、都要防僵尸、都要能整组终止。
 //
 // 已存在的残留 socket 文件会先被删除：上一次进程被 SIGKILL 时不会
 // 清理 socket，残留文件会让新进程 bind 失败（EADDRINUSE）。
@@ -81,8 +103,17 @@ func (p *process) Start(ctx context.Context, binPath string, env []string) (Star
 		return StartResult{}, err
 	}
 
-	//nolint:gosec // binPath 是主程序自身路径，参数由 Descriptor（已校验 ID）派生，无用户输入拼接。
-	cmd := exec.Command(binPath, PluginSubcommandPrefix+p.desc.ID)
+	var cmd *exec.Cmd
+	if p.execPath != "" {
+		// 外部插件：直接 exec 插件自带的可执行文件。
+		//
+		// execPath 在加载阶段已校验过（相对路径、无 ..、文件存在），
+		// 这里的参数全部来自已校验的 descriptor.json。
+		cmd = exec.Command(p.execPath, p.execArgs...)
+	} else {
+		//nolint:gosec // binPath 是主程序自身路径，参数由 Descriptor（已校验 ID）派生，无用户输入拼接。
+		cmd = exec.Command(binPath, PluginSubcommandPrefix+p.desc.ID)
+	}
 	cmd.Env = append(os.Environ(), env...)
 	// 插件日志与核心日志共用 stdout/stderr，便于单机排查；
 	// 后续阶段可改为按插件分流到独立文件。

@@ -21,6 +21,7 @@ import (
 	"lipanel/internal/service"
 	"lipanel/internal/site"
 	"lipanel/internal/ssl"
+	"lipanel/internal/store"
 	"lipanel/internal/sysinfo"
 )
 
@@ -83,6 +84,12 @@ type Options struct {
 	// 而状态接口需要在它不存在时也能正常返回。
 	// 为 nil 时状态里 scheduler.running=false。
 	SSLScheduler *ssl.RenewScheduler
+
+	// Store 是软件商店管理器（阶段四 4.5，核心自带）。
+	//
+	// 为 nil 时 /api/store 返回 503（而不是 panic）：
+	// 与 4.1~4.4 一致，只关心其它功能的测试无需构造它。
+	Store *store.Manager
 }
 
 // Server 封装 HTTP 服务及其依赖。
@@ -98,6 +105,7 @@ type Server struct {
 	siteMgr      *site.Manager
 	sslMgr       *ssl.Manager
 	sslScheduler *ssl.RenewScheduler
+	storeMgr     *store.Manager
 	handler      http.Handler
 	httpSrv      *http.Server
 }
@@ -151,6 +159,9 @@ func New(opts Options) (*Server, error) {
 	// SSL 证书管理（阶段四 4.4）：同上。未注入时 /api/ssl 返回 503。
 	s.sslMgr = opts.SSL
 	s.sslScheduler = opts.SSLScheduler
+
+	// 软件商店（阶段四 4.5）：同上。未注入时 /api/store 返回 503。
+	s.storeMgr = opts.Store
 
 	mux := http.NewServeMux()
 	// 服务路由由 registerAPIRoutes 内部统一注册（核心自带功能，

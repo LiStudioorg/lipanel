@@ -75,6 +75,21 @@ const routes = [
     meta: { title: 'SSL 证书' },
   },
   {
+    // 软件商店（阶段四 4.5）。
+    //
+    // 核心内置能力 + 静态路由（与 /services、/files、/sites、/ssl
+    // 相同的架构决定）：一键安装运行环境是面板的核心能力，
+    // 不该依赖插件机制是否可用。
+    //
+    // 路径用 /store 而不是 /plugins/store：安装软件会以 root 身份
+    // 运行发行版包管理器，是本面板**最高危**的能力，因此它的
+    // 入口、权限（store.write）与审计都独立存在，不挂在插件下。
+    path: '/store',
+    name: 'software-store',
+    component: () => import('@/views/StoreView.vue'),
+    meta: { title: '软件商店' },
+  },
+  {
     // 插件操作审计页（阶段三 3.3）。
     // 必须放在 "/plugins/:id" 之前：否则 "audit" 会被当成插件 ID
     // 命中了通配路由，打开审计页会变成"插件 audit 不存在"。

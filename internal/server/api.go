@@ -62,6 +62,11 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// 已由 registerSSLRoutes 集中处理，详见其注释与
 	// ssl_api_test.go 中锁死该行为的测试。
 	s.registerSSLRoutes(mux)
+
+	// 软件商店（4.5）：一并登记，理由同 4.4。
+	// 注意：registerStoreRoutes 内部把 capabilities/audit/tasks 这些
+	// **固定段**路由放在 /{name}/... 通配之前注册，详见其注释。
+	s.registerStoreRoutes(mux)
 }
 
 // healthResponse 是 /api/health 的响应体，字段使用 snake_case 以便前端直接消费。

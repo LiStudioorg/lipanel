@@ -57,6 +57,14 @@ coverage.txt
 # 需要复现时按开发计划 4.3「验证记录」的说明重建即可。
 .e2e/
 
+# ---------- 本地 Go 构建缓存（沙箱 / HOME 不可写时使用） ----------
+# 与上面的 .npm-cache 同理：开发沙箱的 HOME 不可写，
+# 必须把 GOCACHE / GOMODCACHE / GOTMPDIR 指到工作区内才能编译。
+# **绝不能入库**：体积大且与源码无关。
+.gocache/
+.gomodcache/
+.gotmp/
+
 # ---------- 编辑器 / IDE ----------
 .idea/
 .vscode/

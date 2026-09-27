@@ -1,0 +1,391 @@
+{
+  "_comment": [
+    "内置软件清单（阶段四 4.5）。",
+    "",
+    "本文件是**唯一**可信的包名/源地址来源：用户只能提交软件 ID 与版本 ID，",
+    "两者先过白名单校验，再在清单里查表；真正的包名、GPG key URL、",
+    "源条目、安装脚本 URL 全部来自这里。因此即便校验层被绕过，",
+    "攻击者也拼不出任意的包名或 URL。",
+    "",
+    "编辑须知：",
+    "  · system_packages 必须是该发行版真实存在的包名；",
+    "  · official 的 key 只能是 debian / rhel（其余家族不支持官方源）；",
+    "  · official 里 {distro} 会被替换为发行版代号（Ubuntu jammy / Debian bookworm / RHEL 9）；",
+    "  · prebuilt 只收录**软件官方发布**的归档，不接受第三方静态构建站。",
+    "  · 修改后必须跑 go test ./internal/store —— 清单在解析期做全量校验，",
+    "    写错字段会立刻失败，而不是等用户点了那个软件才炸。"
+  ],
+  "software": [
+    {
+      "id": "nginx",
+      "name": "Nginx",
+      "category": "Web 服务器",
+      "description": "高性能 Web 服务器与反向代理，4.3 网站管理的前置组件",
+      "default_version": "1.26",
+      "official": {
+        "debian": {
+          "kind": "apt-key-source",
+          "key_url": "https://nginx.org/keys/nginx_signing.key",
+          "keyring_path": "/usr/share/keyrings/lipanel-nginx.gpg",
+          "list_file": "lipanel-nginx.list",
+          "source_line_template": "deb [signed-by=/usr/share/keyrings/lipanel-nginx.gpg] https://nginx.org/packages/ubuntu/ {distro} nginx"
+        },
+        "rhel": {
+          "kind": "yum-repo-file",
+          "key_url": "https://nginx.org/keys/nginx_signing.key",
+          "key_path": "/etc/pki/rpm-gpg/lipanel-nginx.gpg",
+          "repo_file": "/etc/yum.repos.d/lipanel-nginx.repo",
+          "repo_content_template": "[lipanel-nginx]\nname=nginx official repo\nbaseurl=https://nginx.org/packages/mainline/centos/{distro}/$basearch/\ngpgcheck=1\nenabled=1\ngpgkey=file:///etc/pki/rpm-gpg/lipanel-nginx.gpg\nmodule_hotfixes=true"
+        }
+      },
+      "versions": [
+        {
+          "id": "1.26",
+          "label": "Nginx 1.26（官方稳定版）",
+          "system_packages": [
+            "nginx"
+          ],
+          "alternative_packages": [
+            "nginx-core"
+          ],
+          "notes": [
+            "该版本来自 nginx.org 官方源：仓库里包名恒为 nginx，因此安装时会钉住源里查到的完整版本号（apt 的 nginx=<版本>），以确保装上的是所选版本而不是源里的其它版本。",
+            "1.26 来自 nginx.org 官方源；系统源通常只提供发行版自带的旧版本。",
+            "安装后 /etc/nginx 下的配置文件由发行版包管理，面板不会改写它们（站点配置走 4.3 的隔离实例约定）。"
+          ],
+          "pin_system_version": true
+        },
+        {
+          "id": "1.24",
+          "label": "Nginx 1.24",
+          "system_packages": [
+            "nginx"
+          ],
+          "alternative_packages": [
+            "nginx-core"
+          ],
+          "pin_system_version": true,
+          "notes": [
+            "该版本来自 nginx.org 官方源：仓库里包名恒为 nginx，因此安装时会钉住源里查到的完整版本号（apt 的 nginx=<版本>），以确保装上的是所选版本而不是源里的其它版本。"
+          ]
+        },
+        {
+          "id": "1.18",
+          "label": "Nginx 1.18（发行版自带）",
+          "system_packages": [
+            "nginx"
+          ],
+          "notes": [
+            "使用发行版仓库里的 nginx，实际版本随发行版而定（Ubuntu 22.04 为 1.18）。"
+          ],
+          "alternative_packages": [
+            "nginx-core"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "php",
+      "name": "PHP",
+      "category": "语言运行时",
+      "description": "PHP-FPM 运行环境，含 CLI 与常用扩展",
+      "default_version": "8.3",
+      "depends": [
+        "nginx"
+      ],
+      "official": {
+        "debian": {
+          "kind": "apt-key-source",
+          "key_url": "https://packages.sury.org/php/apt.gpg",
+          "keyring_path": "/usr/share/keyrings/lipanel-sury-php.gpg",
+          "list_file": "lipanel-sury-php.list",
+          "source_line_template": "deb [signed-by=/usr/share/keyrings/lipanel-sury-php.gpg] https://packages.sury.org/php/ {distro} main"
+        },
+        "rhel": {
+          "kind": "dnf-release-package",
+          "repo_url_template": "https://rpms.remirepo.net/enterprise/remi-release-{distro}.rpm"
+        }
+      },
+      "versions": [
+        {
+          "id": "8.3",
+          "label": "PHP 8.3",
+          "system_packages": [
+            "php8.3-fpm",
+            "php8.3-cli",
+            "php8.3-mysql",
+            "php8.3-curl",
+            "php8.3-mbstring",
+            "php8.3-xml",
+            "php8.3-zip",
+            "php8.3-gd"
+          ],
+          "alternative_packages": [
+            "php83-php-fpm",
+            "php83-php-cli"
+          ],
+          "notes": [
+            "Debian/Ubuntu 上 8.1 以上版本来自 deb.sury.org（ondrej 维护的官方打包）；",
+            "RHEL/Rocky 上来自 remi 仓库。",
+            "安装后再到「网站管理」里把站点的 PHP 处理指向 php-fpm 的 socket。"
+          ]
+        },
+        {
+          "id": "8.2",
+          "label": "PHP 8.2",
+          "system_packages": [
+            "php8.2-fpm",
+            "php8.2-cli",
+            "php8.2-mysql",
+            "php8.2-curl",
+            "php8.2-mbstring",
+            "php8.2-xml",
+            "php8.2-zip",
+            "php8.2-gd"
+          ],
+          "alternative_packages": [
+            "php82-php-fpm",
+            "php82-php-cli"
+          ]
+        },
+        {
+          "id": "8.1",
+          "label": "PHP 8.1",
+          "system_packages": [
+            "php8.1-fpm",
+            "php8.1-cli",
+            "php8.1-mysql",
+            "php8.1-curl",
+            "php8.1-mbstring",
+            "php8.1-xml",
+            "php8.1-zip",
+            "php8.1-gd"
+          ],
+          "alternative_packages": [
+            "php81-php-fpm",
+            "php81-php-cli"
+          ]
+        },
+        {
+          "id": "7.4",
+          "label": "PHP 7.4（已停止安全支持）",
+          "system_packages": [
+            "php7.4-fpm",
+            "php7.4-cli",
+            "php7.4-mysql",
+            "php7.4-curl",
+            "php7.4-mbstring",
+            "php7.4-xml",
+            "php7.4-zip",
+            "php7.4-gd"
+          ],
+          "alternative_packages": [
+            "php74-php-fpm",
+            "php74-php-cli"
+          ],
+          "notes": [
+            "PHP 7.4 已停止官方安全支持，仅在需要兼容老程序时使用。"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "mysql",
+      "name": "MySQL",
+      "category": "数据库",
+      "description": "MySQL 社区版数据库服务",
+      "default_version": "8.4",
+      "official": {
+        "debian": {
+          "kind": "apt-key-source",
+          "key_url": "https://repo.mysql.com/RPM-GPG-KEY-mysql-2023",
+          "keyring_path": "/usr/share/keyrings/lipanel-mysql.gpg",
+          "list_file": "lipanel-mysql.list",
+          "source_line_template": "deb [signed-by=/usr/share/keyrings/lipanel-mysql.gpg] https://repo.mysql.com/apt/ubuntu/ {distro} mysql-{version}"
+        }
+      },
+      "versions": [
+        {
+          "id": "8.4",
+          "label": "MySQL 8.4 LTS",
+          "system_packages": [
+            "mysql-8.4-community-server"
+          ],
+          "alternative_packages": [
+            "mysql-server"
+          ],
+          "notes": [
+            "8.4 是 MySQL 当前的 LTS 版本，官方源组件为 mysql-8.4，包名为 mysql-8.4-community-server。",
+            "官方源需要 MySQL 提供的 GPG 公钥；公钥为 ASCII 格式，要求 apt >= 2.4（Ubuntu 22.04 / Debian 12 及以上满足）。",
+            "RHEL/Rocky 上会回退到发行版自带的 mysql-server（AppStream），面板不会改写 MySQL 官方源配置。"
+          ]
+        },
+        {
+          "id": "8.0",
+          "label": "MySQL 8.0",
+          "system_packages": [
+            "mysql-community-server"
+          ],
+          "alternative_packages": [
+            "mysql-server"
+          ],
+          "notes": [
+            "8.0 在发行版仓库与 MySQL 官方源里都可能存在，面板会先试系统源、再试官方源。",
+            "安装完成后 MySQL 会生成临时 root 密码，见任务日志与 /var/log/mysql/error.log。",
+            "RHEL/Rocky 上会回退到发行版自带的 mysql-server（AppStream）。"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "redis",
+      "name": "Redis",
+      "category": "缓存",
+      "description": "内存键值数据库，常用作缓存与会话存储",
+      "default_version": "7.2",
+      "official": {
+        "debian": {
+          "kind": "apt-key-source",
+          "key_url": "https://packages.redis.io/gpg",
+          "keyring_path": "/usr/share/keyrings/lipanel-redis.gpg",
+          "list_file": "lipanel-redis.list",
+          "source_line_template": "deb [signed-by=/usr/share/keyrings/lipanel-redis.gpg] https://packages.redis.io/deb {distro} main"
+        }
+      },
+      "versions": [
+        {
+          "id": "7.2",
+          "label": "Redis 7.2（官方源）",
+          "system_packages": [
+            "redis"
+          ],
+          "alternative_packages": [
+            "redis-server"
+          ],
+          "notes": [
+            "官方源提供 7.x 系列的最新稳定版，实际小版本随官方源更新而变。"
+          ]
+        },
+        {
+          "id": "7.0",
+          "label": "Redis 7.0（发行版自带）",
+          "system_packages": [
+            "redis-server",
+            "redis"
+          ],
+          "notes": [
+            "使用发行版仓库里的 Redis（Ubuntu 24.04 为 7.0，22.04 为 6.0）。",
+            "若发行版自带版本低于所选版本，安装会失败并提示改用官方源版本。"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nodejs",
+      "name": "Node.js",
+      "category": "语言运行时",
+      "description": "Node.js 运行时与 npm，用于前端构建与 Node 应用",
+      "default_version": "22",
+      "official": {
+        "debian": {
+          "kind": "script",
+          "script_url": "https://deb.nodesource.com/setup_{version}.x"
+        },
+        "rhel": {
+          "kind": "dnf-release-package",
+          "repo_url_template": "https://rpm.nodesource.com/pub_{version}.x/nodistro/repo/nodesource-release-nodistro-1.noarch.rpm"
+        }
+      },
+      "versions": [
+        {
+          "id": "22",
+          "label": "Node.js 22 LTS",
+          "system_packages": [
+            "nodejs"
+          ],
+          "prebuilt": {
+            "kind": "tar.gz",
+            "install_dir": "/usr/local/lib/lipanel/nodejs-22",
+            "link_dir": "/usr/local/bin",
+            "binaries": [
+              "node",
+              "npm",
+              "npx"
+            ],
+            "verify_args": [
+              "--version"
+            ],
+            "notes": [
+              "预编译包是 Node.js 官方发布的静态构建，解包到 /usr/local/lib/lipanel/nodejs-22，",
+              "并在 /usr/local/bin 下建立 node / npm / npx 软链接。",
+              "该路径不经过包管理器，因此不会出现在 apt list --installed 里；",
+              "面板的卸载会移除这些文件。"
+            ],
+            "index_url_template": "https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt",
+            "file_prefix": "node-v",
+            "file_suffix": "-linux-{arch}.tar.gz"
+          },
+          "notes": [
+            "Debian/Ubuntu 通过 NodeSource 官方源安装；该方式会在机器上执行官方安装脚本。"
+          ]
+        },
+        {
+          "id": "20",
+          "label": "Node.js 20 LTS",
+          "system_packages": [
+            "nodejs"
+          ],
+          "prebuilt": {
+            "kind": "tar.gz",
+            "install_dir": "/usr/local/lib/lipanel/nodejs-20",
+            "link_dir": "/usr/local/bin",
+            "binaries": [
+              "node",
+              "npm",
+              "npx"
+            ],
+            "verify_args": [
+              "--version"
+            ],
+            "index_url_template": "https://nodejs.org/dist/latest-v20.x/SHASUMS256.txt",
+            "file_prefix": "node-v",
+            "file_suffix": "-linux-{arch}.tar.gz",
+            "notes": [
+              "预编译包是 Node.js 官方发布的静态构建，解包到 /usr/local/lib/lipanel/nodejs-20，",
+              "并在 /usr/local/bin 下建立 node / npm / npx 软链接。",
+              "该路径不经过包管理器，因此不会出现在 apt list --installed 里；面板的卸载会移除这些文件。"
+            ]
+          }
+        },
+        {
+          "id": "18",
+          "label": "Node.js 18 LTS",
+          "system_packages": [
+            "nodejs"
+          ],
+          "prebuilt": {
+            "kind": "tar.gz",
+            "install_dir": "/usr/local/lib/lipanel/nodejs-18",
+            "link_dir": "/usr/local/bin",
+            "binaries": [
+              "node",
+              "npm",
+              "npx"
+            ],
+            "verify_args": [
+              "--version"
+            ],
+            "index_url_template": "https://nodejs.org/dist/latest-v18.x/SHASUMS256.txt",
+            "file_prefix": "node-v",
+            "file_suffix": "-linux-{arch}.tar.gz",
+            "notes": [
+              "预编译包是 Node.js 官方发布的静态构建，解包到 /usr/local/lib/lipanel/nodejs-18，",
+              "并在 /usr/local/bin 下建立 node / npm / npx 软链接。",
+              "该路径不经过包管理器，因此不会出现在 apt list --installed 里；面板的卸载会移除这些文件。"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

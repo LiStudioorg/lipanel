@@ -35,6 +35,7 @@ import (
 	"lipanel/internal/service"
 	"lipanel/internal/site"
 	"lipanel/internal/ssl"
+	"lipanel/internal/store"
 )
 
 // distFS 承载 web/dist 下的全部前端产物。
@@ -139,6 +140,28 @@ func run() error {
 		certCommandTimeout = flag.Duration("cert-timeout", ssl.DefaultCommandTimeout,
 			"单次 certbot 命令的超时（如 2m、5m）。"+
 				"申请需要与 CA 多次往返，超时设置过短会导致「证书已签发但本地未拿到」")
+
+		storePkgManager = flag.String("store-package-manager", "",
+			"强制指定软件商店使用的包管理器（apt / dnf / yum）；"+
+				"留空则按发行版自动探测。仅在自动探测出错时才需要手工指定")
+		storeStepTimeout = flag.Duration("store-step-timeout", store.DefaultStepTimeout,
+			"软件商店单条命令（apt-get / dnf / curl / tar）的超时（默认 10m）。"+
+				"装 MySQL 这类软件要下载上百 MB，超时过短会在解包中途被掐断")
+		storeTaskTimeout = flag.Duration("store-task-timeout", store.DefaultTaskTimeout,
+			"软件商店单个安装/卸载任务的超时（默认 45m）")
+		storeStateDir = flag.String("store-state-dir", store.DefaultStateDir,
+			"软件商店的状态目录（记录预编译安装、下载缓存）；"+
+				"默认 "+store.DefaultStateDir)
+		storeLogLimit = flag.Int("store-log-limit", store.DefaultLogLimit,
+			"单个任务保留的日志行数上限（超出后丢弃最早的日志）")
+		storeMaxTasks = flag.Int("store-max-tasks", store.DefaultMaxTasks,
+			"内存中保留的最近任务数（面板重启后丢失，历史留痕见审计日志）")
+		storeShutdownGrace = flag.Duration("store-shutdown-grace", store.DefaultShutdownGrace,
+			"退出时等待正在进行的安装/卸载任务收尾的最长时间（默认 15m）。"+
+				"该等待**不会中断**包管理器：超时后进程退出，但 apt/dpkg 可能仍在运行")
+		storeDryRun = flag.Bool("store-dry-run", false,
+			"试运行模式：只记录将要执行的命令，**不安装任何软件、不写任何系统文件**。"+
+				"用于在正式机器上先看清楚面板到底会做什么")
 	)
 	flag.Parse()
 
@@ -489,6 +512,89 @@ func run() error {
 			"reason", sslManager.UnavailableReason())
 	}
 
+	// 软件商店（阶段四 4.5，核心自带）。
+	//
+	// ########## 本模块与其它四个模块最重要的差别 ##########
+	//
+	// 4.1~4.4 的写操作都是"改面板管得着的东西"（服务、文件、站点配置、证书）。
+	// 软件商店不是：它**以 root 身份运行发行版包管理器**，
+	// 而包的 postinst 脚本可以改动系统里的任何东西。
+	// 因此这里额外做了三件事：
+	//
+	//	① 清单内嵌在二进制里（catalog.json 经 go:embed），
+	//	   用户输入只用于查表，不能影响命令内容；
+	//	② 官方源相关的系统路径可被 -store-* 之外的覆盖项重定向，
+	//	   便于隔离测试；生产使用默认系统路径；
+	//	③ 提供 -store-dry-run，让用户能先看清楚会执行什么。
+	//
+	// 审计同样"统一落盘、分别查询"：与插件/服务/文件/站点/SSL 审计
+	// 共用同一个 -audit-log 文件（JSONL 追加写），有独立类型、
+	// 环形缓冲与查询接口（/api/store/audit），互不污染。
+	storeAuditor, err := store.NewAuditor(store.AuditOptions{
+		Capacity: *pluginAuditBuf,
+		Path:     *pluginAuditLog,
+		Logger:   logger,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = storeAuditor.Close() }()
+
+	// 环境探测：决定用哪个包管理器、发行版代号、架构。
+	// 探测失败**不阻断启动**——面板其它功能必须照常可用
+	// （与 4.1 无 systemd、4.3 无 nginx 的降级策略一致）。
+	storeVars := store.DetectVars(store.AdapterOptions{ForceManager: *storePkgManager})
+
+	storeManager, err := store.NewManager(store.Options{
+		Logger:      logger,
+		Auditor:     storeAuditor,
+		Vars:        storeVars,
+		SkipDetect:  true, // 环境已在上面探测过，避免二次探测得出不同结论
+		StateDir:    *storeStateDir,
+		StepTimeout: *storeStepTimeout,
+		TaskTimeout: *storeTaskTimeout,
+		LogLimit:    *storeLogLimit,
+		MaxTasks:    *storeMaxTasks,
+		DryRun:      *storeDryRun,
+
+		// ########## 系统路径的隔离开关（仅测试与嵌入场景） ##########
+		//
+		// 追加官方源需要写三个位置。生产环境必须是系统路径
+		// （否则 apt/dnf 根本不认这些源）；但端到端测试必须能
+		// 在**不污染开发机**的前提下把这条链路跑完。
+		//
+		// 这里用环境变量而不是命令行参数，是刻意的：
+		// 它不该出现在 --help 里引导用户去改（改错了面板写的源
+		// 就不会被系统识别，表现为"追加官方源成功但装不上"，
+		// 极难排查）。环境变量只在自动化测试的脚本里出现。
+		ListDirOverride:    os.Getenv("LIPANEL_STORE_LIST_DIR"),
+		KeyringDirOverride: os.Getenv("LIPANEL_STORE_KEYRING_DIR"),
+		YumRepoDirOverride: os.Getenv("LIPANEL_STORE_YUM_REPO_DIR"),
+	})
+	if err != nil {
+		return fmt.Errorf("初始化软件商店失败: %w", err)
+	}
+
+	if storeManager.Available() {
+		logger.Info("软件商店已就绪",
+			"env", storeVars.Describe(),
+			"official_source", storeVars.SupportsOfficialSource(),
+			"software", len(storeManager.Catalog().Software),
+			"state_dir", *storeStateDir,
+			"dry_run", *storeDryRun,
+		)
+		for _, note := range storeVars.ProbeNotes {
+			logger.Info("软件商店提示", "note", note)
+		}
+		if *storeDryRun {
+			logger.Warn("软件商店处于试运行模式（-store-dry-run）：" +
+				"不会真的安装任何软件，也不会写入任何系统文件")
+		}
+	} else {
+		logger.Warn("软件商店不可用，面板其它功能不受影响",
+			"reason", storeManager.UnavailableReason())
+	}
+
 	// 注入内嵌前端资源（go:embed 在根目录，见本文件顶部 distFS）。
 	// 仅在没有用 -static-dir 覆盖时才需要解析；解析失败属构建错误，直接终止。
 	var (
@@ -519,6 +625,7 @@ func run() error {
 		// 调度器单独注入：它是可选的（用户可能只想手动续期），
 		// 而状态接口需要在它不存在时也能正常返回。
 		SSLScheduler: sslScheduler,
+		Store:        storeManager,
 	})
 	if err != nil {
 		return err
@@ -558,6 +665,35 @@ func run() error {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			return err
 		}
+
+		// ########## 等待正在进行的安装任务收尾 ##########
+		//
+		// 这一段的顺序很关键，而且用的是**独立于 shutdownCtx 的超时**。
+		//
+		// 10 秒的 shutdownCtx 对 HTTP 收尾够用，但对装软件远远不够：
+		// `apt-get install mysql-server` 要跑几分钟。若在它执行到一半时
+		// 退出进程，dpkg 的数据库会停在"半安装（iF）"状态，
+		// 用户下次启动面板看到的是一个坏掉的 apt ——
+		// 而且这个问题**无法通过重试面板修复**，只能人工 dpkg --configure -a。
+		//
+		// 因此：先停止接收新请求（上面的 srv.Shutdown），
+		// 再给正在跑的任务一段专门的等待时间。超时后**不杀进程**——
+		// 我们只能选择"等它"或"留它继续跑"，绝不做第三种事。
+		if storeManager.RunningTask() != nil || !storeManager.Idle() {
+			storeCtx, storeCancel := context.WithTimeout(
+				context.Background(), *storeShutdownGrace)
+			logger.Info("有安装/卸载任务正在进行，等待其收尾（不会中断包管理器）",
+				"grace", storeShutdownGrace.String())
+			if err := storeManager.Shutdown(storeCtx); err != nil {
+				logger.Warn("安装/卸载任务未在宽限期内结束；"+
+					"进程退出后包管理器可能仍在运行，"+
+					"请勿立即重启面板（会与它抢同一把全局锁）", "err", err)
+			} else {
+				logger.Info("安装/卸载任务已收尾")
+			}
+			storeCancel()
+		}
+
 		// 停止插件进程：核心退出却留下孤儿插件进程会占着 socket，
 		// 下次启动时还会误连到一个「上辈子的」插件上。
 		if err := pluginManager.Shutdown(shutdownCtx); err != nil {

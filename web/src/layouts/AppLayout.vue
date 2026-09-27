@@ -47,6 +47,10 @@ const builtinMenus = [
   // 证书是面板对外提供服务的基础能力，且到期不处理会直接导致
   // 站点无法访问，必须始终可达。
   { key: 'ssl-cert', label: 'SSL 证书', icon: '🔒', to: { name: 'ssl-cert' } },
+  // 软件商店（阶段四 4.5）：内置页面而非插件——
+  // 一键安装运行环境是面板的核心能力，且它是最需要审计入口的能力
+  // （以 root 运行发行版包管理器），必须始终可达。
+  { key: 'software-store', label: '软件商店', icon: '🛒', to: { name: 'software-store' } },
   { key: 'plugins', label: '插件管理', icon: '🧩', to: { name: 'plugin-list' } },
   // 审计页（阶段三 3.3）：权限声明是"拒绝对了没"的唯一可见证据，
   // 因此把它放在一级菜单，而不是藏进插件详情里。

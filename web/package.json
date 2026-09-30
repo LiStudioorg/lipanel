@@ -8,9 +8,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test src/plugins/bridge.test.mjs src/views/services.logic.test.mjs src/views/file.logic.test.mjs src/views/site.logic.test.mjs src/views/ssl.logic.test.mjs src/views/store.logic.test.mjs src/views/firewall.logic.test.mjs"
+    "test": "node --test src/plugins/bridge.test.mjs src/views/services.logic.test.mjs src/views/file.logic.test.mjs src/views/site.logic.test.mjs src/views/ssl.logic.test.mjs src/views/store.logic.test.mjs src/views/firewall.logic.test.mjs src/views/terminal.logic.test.mjs"
   },
   "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
     "naive-ui": "^2.40.1",
     "vue": "^3.5.13",
     "vue-router": "^4.6.4"

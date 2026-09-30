@@ -41,6 +41,7 @@ import (
 	"lipanel/internal/site"
 	"lipanel/internal/ssl"
 	"lipanel/internal/store"
+	"lipanel/internal/terminal"
 )
 
 // distFS 承载 web/dist 下的全部前端产物。
@@ -198,6 +199,24 @@ func run() error {
 		firewallDryRun = flag.Bool("firewall-dry-run", false,
 			"试运行模式：只记录将要执行的防火墙命令，**不修改任何防火墙规则**。"+
 				"用于在正式机器上先看清楚面板到底会做什么（防火墙误操作可能导致失联）")
+
+		// ---------- Web 终端（阶段五 5.1）----------
+		terminalShell = flag.String("terminal-shell", "",
+			"Web 终端使用的 shell 路径（留空则按 $SHELL → /bin/bash → /bin/sh 依次探测）。"+
+				"面板进程的 $SHELL 未必是你在 SSH 里用的那个（systemd 启动时通常为空），"+
+				"想固定用 zsh 等就显式指定")
+		terminalIdleTimeout = flag.Duration("terminal-idle-timeout", terminal.DefaultIdleTimeout,
+			"终端空闲超时（默认 30m）。超过该时长没有任何输入/输出/心跳即自动断开会话。"+
+				"设为 0 可关闭超时（不推荐：会留下永不回收的 shell 进程）")
+		terminalMaxSessions = flag.Int("terminal-max-sessions", terminal.DefaultMaxSessions,
+			"同时存在的终端会话数上限（默认 10）。每个会话 = 一个 shell 进程 + 一个 PTY，"+
+				"因此必须有上限，防止误操作把机器资源耗尽")
+		terminalWorkDir = flag.String("terminal-workdir", "",
+			"终端会话的初始工作目录（留空则继承面板进程的当前目录）")
+		terminalOrigins = flag.String("terminal-origins", "",
+			"允许连接 Web 终端的额外 Origin 白名单（逗号分隔，如 https://panel.example.com）。"+
+				"**默认只允许同源**：WebSocket 不受同源策略保护且浏览器会自动携带 Cookie，"+
+				"因此必须校验 Origin 防 CSWSH。仅当面板与页面确实跨域时才需要配置")
 	)
 	flag.Parse()
 
@@ -822,6 +841,63 @@ func run() error {
 			"ssh_ports_explicit", sshPorts)
 	}
 
+	// ---------- Web 终端（阶段五 5.1，核心自带）----------
+	//
+	// 审计同样是「统一落盘、分别查询」：与其它七个审计器共用同一个
+	// -audit-log 文件（JSONL 追加写），但有独立的类型、环形缓冲与
+	// 查询接口（/api/terminal/audit），互不污染。
+	terminalAuditor, err := terminal.NewAuditor(terminal.AuditOptions{
+		Capacity: *pluginAuditBuf,
+		Path:     *pluginAuditLog,
+		Logger:   logger,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化终端审计失败: %w", err)
+	}
+	defer func() { _ = terminalAuditor.Close() }()
+
+	// ########## 终端管理器在 Windows 上也会成功构造 ##########
+	//
+	// Windows 没有 POSIX 伪终端，终端功能在该平台**必然不可用**。
+	// 但这里**不能让 NewManager 失败**：那会导致整个面板起不来，
+	// 而 Windows 用户其实能用服务/文件/网站/SSL/商店等全部其它功能。
+	//
+	// 因此 terminal 包内做了优雅降级：不支持的平台上构造一个
+	// 「可用但拒绝创建会话」的 Manager，status 接口如实报告
+	// supported=false + 原因，前端据此渲染说明性提示。
+	terminalManager, err := terminal.NewManager(terminal.ManagerOptions{
+		Shell:          *terminalShell,
+		IdleTimeout:    *terminalIdleTimeout,
+		MaxSessions:    *terminalMaxSessions,
+		WorkDir:        *terminalWorkDir,
+		AllowedOrigins: splitCSV(*terminalOrigins),
+		Auditor:        terminalAuditor,
+		Logger:         logger,
+	})
+	if err != nil {
+		// 走到这里说明是**真实的配置错误**（例如 -terminal-shell
+		// 指向一个不存在的路径），而不是平台不支持。
+		// 这种情况下应当明确报错，而不是静默降级——
+		// 否则用户会以为自己的参数生效了。
+		return fmt.Errorf("初始化终端管理器失败: %w", err)
+	}
+
+	if terminalManager.Supported() {
+		logger.Info("Web 终端已就绪",
+			"shell", terminalManager.Shell(),
+			"idle_timeout", terminalManager.IdleTimeout().String(),
+			"max_sessions", terminalManager.MaxSessions())
+		if *terminalIdleTimeout <= 0 {
+			logger.Warn("终端空闲超时已关闭（-terminal-idle-timeout=0）：" +
+				"忘记关闭的会话会一直保留 shell 进程")
+		}
+	} else {
+		// 醒目提示，避免用户对着一个"点了没反应"的页面猜原因。
+		logger.Warn("当前平台不支持 Web 终端，该功能将优雅降级（其它功能不受影响）",
+			"os", terminalManager.Capability().OS,
+			"reason", terminalManager.Capability().Reason)
+	}
+
 	// 注入内嵌前端资源（go:embed 在根目录，见本文件顶部 distFS）。
 	// 仅在没有用 -static-dir 覆盖时才需要解析；解析失败属构建错误，直接终止。
 	var (
@@ -854,6 +930,7 @@ func run() error {
 		SSLScheduler: sslScheduler,
 		Store:        storeManager,
 		Firewall:     firewallManager,
+		Terminal:     terminalManager,
 	})
 	if err != nil {
 		return err
@@ -1418,4 +1495,23 @@ func bootstrapCtx() context.Context {
 		cancel()
 	}()
 	return ctx
+}
+
+// splitCSV 把逗号分隔的字符串切成去除空白项的切片。
+//
+// 用于 -terminal-origins 这类"多个值"的命令行参数。
+// 返回 nil（而不是空切片）当没有任何有效项：调用方据此判断
+// "未配置白名单"，语义上是"仅允许同源"而不是"允许空字符串"。
+//
+// 空项必须被剔除：`-terminal-origins=a,,b` 或结尾多一个逗号
+// 是用户很自然会敲出来的，若把空串当成一个合法 Origin 加进白名单，
+// 就会意外放行 Origin 为空的请求（那是非浏览器客户端的形态）。
+func splitCSV(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if item := strings.TrimSpace(part); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }

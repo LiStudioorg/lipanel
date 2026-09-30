@@ -24,6 +24,7 @@ import (
 	"lipanel/internal/ssl"
 	"lipanel/internal/store"
 	"lipanel/internal/sysinfo"
+	"lipanel/internal/terminal"
 )
 
 // Options 是构造 Server 所需的配置。
@@ -101,6 +102,23 @@ type Options struct {
 	// 那种情况下接口返回 200 且 available=false + 安装指引，
 	// 让前端能渲染出带原因的说明页而不是一个红色错误框。
 	Firewall *firewall.Manager
+
+	// Terminal 是 Web 终端会话管理器（阶段五 5.1，核心自带）。
+	//
+	// 为 nil 时 /api/terminal 返回 503（而不是 panic）：
+	// 与 4.1~4.6 一致，只关心其它功能的测试无需构造它。
+	//
+	// ########## 与其它模块最重要的区别：平台能力 ##########
+	//
+	// Windows 等没有伪终端（PTY）的平台上，终端功能**必然不可用**。
+	// 但那种平台上注入的 Manager 依然是有效的：它只是会拒绝
+	// 创建会话（ErrUnsupported），并在 status 里如实报告
+	// supported=false + 原因。
+	//
+	// 这样设计是为了让 Windows 用户仍能使用面板的其它全部功能，
+	// 而不是因为一个终端让整个面板起不来
+	// （见 internal/terminal/errors.go 的优雅降级说明）。
+	Terminal *terminal.Manager
 }
 
 // Server 封装 HTTP 服务及其依赖。
@@ -118,6 +136,7 @@ type Server struct {
 	sslScheduler *ssl.RenewScheduler
 	storeMgr     *store.Manager
 	firewallMgr  *firewall.Manager
+	terminalMgr  *terminal.Manager
 	handler      http.Handler
 	httpSrv      *http.Server
 }
@@ -182,6 +201,13 @@ func New(opts Options) (*Server, error) {
 	// 一律注入假执行器（见 internal/server/firewall_api_test.go
 	// 与 .e2e/run-firewall-e2e.sh）——绝不让测试碰宿主机防火墙。
 	s.firewallMgr = opts.Firewall
+
+	// Web 终端（阶段五 5.1）：同上。未注入时 /api/terminal 返回 503。
+	//
+	// 特别注意：本模块会**真实 fork 出 shell 进程**。
+	// Windows 等无 PTY 平台上 Manager 仍可构造，但创建会话会返回
+	// ErrUnsupported——降级判断在 terminal 包内，这里不重复判断。
+	s.terminalMgr = opts.Terminal
 
 	mux := http.NewServeMux()
 	// 服务路由由 registerAPIRoutes 内部统一注册（核心自带功能，

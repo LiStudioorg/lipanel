@@ -88,6 +88,33 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// （只能靠物理控制台恢复）。因此测试与端到端验证
 	// 一律注入假执行器，绝不碰宿主机防火墙。
 	s.registerFirewallRoutes(mux)
+
+	// ---------- Web 终端（阶段五 5.1，核心自带）----------
+	//
+	// 与 4.1~4.6 同一套架构：terminal_api.go 承载 handler，
+	// internal/terminal 承载 PTY 会话、手写 WebSocket、权限与审计。
+	//
+	// ########## 本模块在接口层的三个特殊之处 ##########
+	//
+	// ① **唯一的 WebSocket 端点**（GET /api/terminal/ws）。
+	//    它同样挂 RequireAuth，且**鉴权必须发生在 Upgrade 之前**——
+	//    一旦写出 101，HTTP 语义就结束了，再想返回 401/403 已不可能。
+	//    另外 WebSocket 不受同源策略保护（浏览器会自动带 Cookie），
+	//    因此 handler 内还额外做 Origin 校验防 CSWSH。
+	//
+	// ② **Windows 上返回 501 而不是 500**。
+	//    Windows 没有 POSIX 伪终端，终端功能在该平台必然不可用。
+	//    501 让前端能渲染「本平台不支持」的说明性提示，
+	//    而不是把一个技术错误直接甩给用户。
+	//
+	// ③ 创建会话是本面板**最高危**的操作之一：服务器上从此多了一个
+	//    以面板身份运行的 shell。因此全部创建/连接/断开都留痕
+	//    （kind: terminal、source: core），且服务端强制
+	//    「一个会话只能被一个客户端连接」。
+	//
+	// ⚠️ 该注册函数内部有**顺序要求**（固定段路由必须先于通配注册），
+	// 已由 registerTerminalRoutes 集中处理。
+	s.registerTerminalRoutes(mux)
 }
 
 // healthResponse 是 /api/health 的响应体，字段使用 snake_case 以便前端直接消费。

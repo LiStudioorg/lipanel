@@ -677,4 +677,3 @@ func assertPluginDirEmpty(t *testing.T, dir string) {
 	}
 	t.Fatalf("插件目录应为空，实际有: %v", names)
 }
-

@@ -4,8 +4,8 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bytes"
-	"encoding/json"
 	"compress/gzip"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
@@ -173,16 +173,16 @@ func TestExternalIDValidation(t *testing.T) {
 	}
 
 	invalid := []string{
-		"",                    // 空
-		"a",                   // 太短（至少 2 位）
-		"1abc",                // 首位不是字母
-		"-abc",                // 首位是连字符
-		"Abc",                 // 含大写
-		"my_plugin",           // 含下划线
-		"my.plugin",           // 含点（目录穿越风险）
-		"../evil",             // 目录穿越
-		"a/b",                 // 含斜杠
-		"abc-",                // 以连字符结尾
+		"",                      // 空
+		"a",                     // 太短（至少 2 位）
+		"1abc",                  // 首位不是字母
+		"-abc",                  // 首位是连字符
+		"Abc",                   // 含大写
+		"my_plugin",             // 含下划线
+		"my.plugin",             // 含点（目录穿越风险）
+		"../evil",               // 目录穿越
+		"a/b",                   // 含斜杠
+		"abc-",                  // 以连字符结尾
 		strings.Repeat("a", 64), // 太长（上限 63）
 	}
 	for _, id := range invalid {
@@ -359,14 +359,14 @@ func TestParseExternalDescriptorRejectsBadPermissions(t *testing.T) {
 // 或指向主程序产物，甚至站外地址。
 func TestExternalFrontendEntryMustBeOwnAssets(t *testing.T) {
 	bad := []string{
-		"/plugin-assets/other/plugin.js",    // 指向别的插件
-		"/assets/index.js",                  // 指向主程序产物
-		"https://evil.example.com/x.js",     // 站外
-		"//evil.example.com/x.js",           // 协议相对
-		"plugin.js",                         // 相对路径
+		"/plugin-assets/other/plugin.js",      // 指向别的插件
+		"/assets/index.js",                    // 指向主程序产物
+		"https://evil.example.com/x.js",       // 站外
+		"//evil.example.com/x.js",             // 协议相对
+		"plugin.js",                           // 相对路径
 		"/plugin-assets/aa/../../../etc/x.js", // 穿越
-		"/plugin-assets/aa/",                // 只有目录，没有文件名
-		"/plugin-assets/aab/plugin.js",      // 前缀相似但不是自己的目录
+		"/plugin-assets/aa/",                  // 只有目录，没有文件名
+		"/plugin-assets/aab/plugin.js",        // 前缀相似但不是自己的目录
 	}
 	for _, entry := range bad {
 		raw := `{"apiVersion":"1","id":"aa","name":"x","version":"1.0.0",
@@ -652,11 +652,11 @@ func TestExternalPluginCannotOverrideBuiltin(t *testing.T) {
 
 	// 手动注册一个"内置插件"（模拟 main 里 RegisterAllBuiltins 的结果）。
 	if err := m.Register(Descriptor{
-		ID:      builtinID,
-		Name:    "系统信息（插件版）",
-		Version: "0.2.0",
-		Builtin: true,
-		Mode:    ModeManaged,
+		ID:          builtinID,
+		Name:        "系统信息（插件版）",
+		Version:     "0.2.0",
+		Builtin:     true,
+		Mode:        ModeManaged,
 		Permissions: []string{"system.read"},
 	}); err != nil {
 		t.Fatalf("注册内置插件失败: %v", err)
@@ -776,13 +776,13 @@ func TestSafeJoinRejectsTraversal(t *testing.T) {
 		"../evil.txt",
 		"../../evil.txt",
 		"../../../etc/passwd",
-		"a/../../evil.txt",           // 嵌套 ..（第一层检查要能看穿）
+		"a/../../evil.txt", // 嵌套 ..（第一层检查要能看穿）
 		"a/b/../../../evil.txt",
-		"..\\evil.txt",               // Windows 分隔符变体
+		"..\\evil.txt", // Windows 分隔符变体
 		"a\\..\\..\\evil.txt",
-		"/etc/passwd",                // 绝对路径
+		"/etc/passwd", // 绝对路径
 		"/tmp/evil.txt",
-		"C:/Windows/evil.txt",        // 盘符
+		"C:/Windows/evil.txt", // 盘符
 		"./../evil.txt",
 		"..",
 	}

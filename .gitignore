@@ -93,3 +93,12 @@ desktop.ini
 # web/dist，该目录在干净的 checkout 里根本不存在——被 ignore 了。
 # 入库后 checkout 即可编译，无需在工作流里做额外同步。
 # 一致性由 build.sh 保证：它会把源码那份同步过来，并可在 CI 里做校验。
+
+# ---------- curl / 测试临时文件（含 token，严禁入库） ----------
+ck.txt
+*.cookies
+*cookie*.txt
+
+# ---------- 本地构建产物 ----------
+/lipanel
+/lipanel.exe

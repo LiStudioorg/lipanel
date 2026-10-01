@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"lipanel/internal/auth"
+	"lipanel/internal/backup"
 	"lipanel/internal/cron"
 	"lipanel/internal/file"
 	"lipanel/internal/firewall"
@@ -134,6 +135,20 @@ type Options struct {
 	// 因此它比其它模块更依赖「先备份、失败回滚、命令原文进审计」这三件事，
 	// 具体实现见 internal/cron/manager.go 的固定时序注释。
 	Cron *cron.Manager
+
+	// Backup 是备份恢复管理器（阶段五 5.3，核心自带）。
+	//
+	// 为 nil 时 /api/backup 返回 503（而不是 panic）：与 4.1~4.6、5.1、5.2
+	// 一致，只关心其它功能的测试无需构造它。
+	//
+	// ########## 本模块与 5.2 的关系 ##########
+	//
+	// 备份任务**复用 5.2 的 cron 机制**：每个启用中的备份任务对应
+	// crontab 上的一条普通计划任务，那条任务通过 `自身二进制 __backup_run <id>`
+	// 拉子进程执行备份。因此 Backup 依赖一个已注入的 Cron；
+	// Cron 为 nil 时备份任务仍可保存并手动执行，只是不会定时跑
+	// （状态接口会如实说明原因，见 internal/backup/cronlink.go）。
+	Backup *backup.Manager
 }
 
 // Server 封装 HTTP 服务及其依赖。
@@ -153,6 +168,7 @@ type Server struct {
 	firewallMgr  *firewall.Manager
 	terminalMgr  *terminal.Manager
 	cronMgr      *cron.Manager
+	backupMgr    *backup.Manager
 	handler      http.Handler
 	httpSrv      *http.Server
 }
@@ -232,6 +248,14 @@ func New(opts Options) (*Server, error) {
 	// fileStore（-cron-file / Options.FilePath），绝不让测试碰宿主机 crontab
 	// ——与 4.6 的假执行器、4.5 的 LIPANEL_STORE_* 同一纪律。
 	s.cronMgr = opts.Cron
+
+	// 备份恢复（阶段五 5.3）：同上。未注入时 /api/backup 返回 503。
+	//
+	// ⚠️ 本模块的执行路径会**真实读写文件系统与远端存储**。
+	// 因此测试与端到端验证一律把数据目录、源路径白名单、
+	// 恢复目标白名单全部指向临时目录，本地存储也只用临时目录
+	// （绝不碰宿主机的备份目录与云存储）——与 5.2 的 -cron-file 同一纪律。
+	s.backupMgr = opts.Backup
 
 	mux := http.NewServeMux()
 	// 服务路由由 registerAPIRoutes 内部统一注册（核心自带功能，

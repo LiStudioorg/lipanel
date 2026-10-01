@@ -140,6 +140,31 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// ⚠️ 该注册函数内部有**顺序要求**（固定段路由必须先于通配注册），
 	// 已由 registerCronRoutes 集中处理。
 	s.registerCronRoutes(mux)
+
+	// ---------- 备份恢复（阶段五 5.3，核心自带）----------
+	//
+	// 与 4.1~4.6、5.1、5.2 同一套架构：backup_api.go 承载 handler，
+	// internal/backup 承载打包、存储后端（本地 / S3 / WebDAV）、
+	// 保留策略、恢复与路径安全、权限与审计。
+	//
+	// ########## 本模块在接口层的三个特殊之处 ##########
+	//
+	// ① **恢复是本面板唯一不可逆的操作**。
+	//    它会覆盖目标目录里与归档同名的文件，且没有撤销。
+	//    因此服务端强制「confirm=true **且** confirm_text 逐字等于任务名」，
+	//    缺任一返回 **428 Precondition Required**。
+	//
+	// ② **下载与删除只接受"能反查回任务"的对象名**。
+	//    若接口直接拿一个对象名去存储上取，它就是一个
+	//    「登录即可读取桶内任意对象」的入口。
+	//
+	// ③ **凭证一个字都不回显**。存储列表返回的是脱敏副本
+	//    （Manager 内部就调了 Redacted），编辑时省略密钥字段
+	//    表示"不改动"而不是"清空"。
+	//
+	// ⚠️ 该注册函数内部有**顺序要求**（固定段路由必须先于通配注册），
+	// 已由 registerBackupRoutes 集中处理。
+	s.registerBackupRoutes(mux)
 }
 
 // healthResponse 是 /api/health 的响应体，字段使用 snake_case 以便前端直接消费。

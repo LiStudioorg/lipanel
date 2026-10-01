@@ -69,6 +69,10 @@ const builtinMenus = [
   // 「什么都没发生」，因此用户必须随时能进来确认任务还在不在。
   // 放在终端之后：两者都是"出了问题要能进去看/改"的页面。
   { key: 'cron', label: '计划任务', icon: '⏰', to: { name: 'cron' } },
+  // 备份恢复（阶段五 5.3）：内置页面而非插件——
+  // 备份任务复用 5.2 的 cron 机制，且它提供的是整面板唯一不可逆的
+  // 「恢复到目标」操作，必须随时可达，不能依赖插件机制。
+  { key: 'backup', label: '备份与恢复', icon: '💾', to: { name: 'backup' } },
   { key: 'terminal', label: '终端', icon: '⌨️', to: { name: 'terminal' } },
   { key: 'plugins', label: '插件管理', icon: '🧩', to: { name: 'plugin-list' } },
   // 审计页（阶段三 3.3）：权限声明是"拒绝对了没"的唯一可见证据，

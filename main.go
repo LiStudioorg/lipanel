@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"lipanel/internal/auth"
+	"lipanel/internal/backup"
 	"lipanel/internal/config"
 	"lipanel/internal/cron"
 	"lipanel/internal/file"
@@ -87,6 +88,12 @@ func run() error {
 	// flag 包遇到 "__plugin_sysinfo" 这类非 - 开头的参数会直接报错退出，
 	// 而该参数正是核心拉起插件进程时传入的。
 	if handled, err := maybeRunAsPlugin(); handled {
+		return err
+	}
+	// 备份自调用子命令（阶段五 5.3）：与插件模式同理，
+	// 必须在 flag.Parse 之前判断——`__backup_run` 不以 - 开头，
+	// flag 包遇到它会直接报错退出。
+	if handled, err := maybeRunAsBackupRunner(); handled {
 		return err
 	}
 
@@ -240,6 +247,38 @@ func run() error {
 		cronBackupKeep = flag.Int("cron-backup-keep", cron.DefaultBackupKeep,
 			"保留的 crontab 备份份数（默认 10）。每次写操作前都会备份改前内容，"+
 				"不清理的话一年下来目录里会有几万个文件")
+
+		// ---------- 备份恢复（阶段五 5.3）----------
+		backupDataDir = flag.String("backup-data-dir", backup.DefaultDataDir,
+			"备份数据目录：tasks.json（任务与存储配置，0600）、history/（每任务一个 JSONL）、"+
+				"locks/（跨进程执行锁）、staging/（打包中间文件）都在其下")
+		backupStorePath = flag.String("backup-store", "",
+			"备份配置文件的完整路径（留空则用 <backup-data-dir>/tasks.json）。"+
+				"定时执行的自调用子进程靠这个参数找到任务定义")
+		backupSourceRoot = flag.String("backup-source-root", backup.DefaultSourceRoot,
+			"允许作为**备份源**的白名单根目录（逗号分隔，默认 /）。"+
+				"面板以 root 运行时，这个白名单决定用户能把哪些目录打包送走；"+
+				"想收窄（例如只允许 /var/www,/home）就显式配置")
+		backupRestoreRoot = flag.String("backup-restore-root", backup.DefaultRestoreRoot,
+			"允许作为**恢复目标**的白名单根目录（逗号分隔）。"+
+				"⚠️ 默认是收紧的（只允许面板自己的目录）：恢复会**覆盖**目标目录里"+
+				"与归档同名的文件且不可撤销，默认放开到 / 意味着一处填错就能覆盖系统文件。"+
+				"确需恢复到别处时显式配置")
+		backupExecTimeout = flag.Duration("backup-exec-timeout", backup.DefaultExecTimeout,
+			"单次备份执行（打包 + 上传）的总超时（默认 30m）。超时后整次执行失败并留痕；"+
+				"执行锁的陈旧判定也以此为据")
+		backupHTTPTimeout = flag.Duration("backup-http-timeout", backup.DefaultHTTPTimeout,
+			"单次存储请求（PUT/GET/PROPFIND 等）的超时（默认 60s）。"+
+				"它约束的是单个 HTTP 请求，不是整次备份")
+		backupMaxBytes = flag.Int64("backup-max-bytes", backup.DefaultMaxArchiveBytes,
+			"单个归档的体积上限（默认 10GiB）。防止误把 / 整个配进来之后，"+
+				"面板安静地开始打包整个系统并打满 staging 所在分区")
+		backupMaxSourceBytes = flag.Int64("backup-max-source-bytes", backup.DefaultMaxSourceBytes,
+			"单次打包的源数据总量上限（默认 10GiB，打包前统计）")
+		backupMaxEntries = flag.Int("backup-max-entries", backup.DefaultMaxEntries,
+			"单次打包的条目数上限（默认 100 万）。防的是「几百万个小文件」把打包拖到以小时计")
+		backupMaxHistory = flag.Int("backup-max-history", backup.DefaultMaxHistoryEntries,
+			"每个备份任务保留的历史条数（默认 500），超出后截断最早的")
 	)
 	flag.Parse()
 
@@ -990,6 +1029,71 @@ func run() error {
 			"cron_user", *cronUser)
 	}
 
+	// ---------- 备份恢复（阶段五 5.3，核心自带）----------
+	//
+	// 审计同样是「统一落盘、分别查询」：与其它九个审计器共用同一个
+	// -audit-log 文件（JSONL 追加写），但有独立类型、环形缓冲与查询接口
+	// （/api/backup/audit），互不污染。
+	backupAuditor, err := backup.NewAuditor(backup.AuditOptions{
+		Capacity: *pluginAuditBuf,
+		Path:     *pluginAuditLog,
+		Logger:   logger,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化备份审计失败: %w", err)
+	}
+	defer func() { _ = backupAuditor.Close() }()
+
+	backupSourceRoots := splitList(*backupSourceRoot)
+	backupRestoreRoots := splitList(*backupRestoreRoot)
+	backupManager, err := backup.NewManager(backup.Options{
+		DataDir:      *backupDataDir,
+		StorePath:    *backupStorePath,
+		SourceRoots:  backupSourceRoots,
+		RestoreRoots: backupRestoreRoots,
+		// 显式配置过恢复根才算"管理员放开的"：
+		// 界面据此决定是显示"已收紧到面板目录"还是"管理员放开的目录"。
+		RestoreRootExplicit: explicit["backup-restore-root"],
+		ExecTimeout:         *backupExecTimeout,
+		HTTPTimeout:         *backupHTTPTimeout,
+		MaxArchiveBytes:     *backupMaxBytes,
+		MaxSourceBytes:      *backupMaxSourceBytes,
+		MaxEntries:          *backupMaxEntries,
+		MaxHistoryEntries:   *backupMaxHistory,
+		Cron:                cronManager,
+		Logger:              logger,
+		Auditor:             backupAuditor,
+	})
+	if err != nil {
+		// 目录建不起来（权限、只读文件系统）是真实的配置错误，
+		// 必须明确报错，而不是让用户以为任务保存成功了。
+		return fmt.Errorf("初始化备份管理器失败: %w", err)
+	}
+
+	// ########## 启动阶段绝不做任何备份、也不碰任何存储 ##########
+	//
+	// 与 5.2 的「启动时不改写 crontab」同一纪律：加载配置只是读一个
+	// JSON 文件。一次都没有"启动就把整机打包上传"这种事发生。
+	backupStatus := backupManager.Status(bootstrapCtx())
+	logger.Info("备份恢复已就绪",
+		"data_dir", backupManager.DataDir(),
+		"tasks", backupStatus.TaskCount,
+		"storages", backupStatus.StorageCount,
+		"source_roots", strings.Join(backupStatus.SourceRoots, ","),
+		"restore_roots", strings.Join(backupStatus.RestoreRoots, ","))
+	if backupStatus.RestoreRootNarrow {
+		logger.Info("恢复目标已收紧到面板自有目录（默认值）。"+
+			"需要恢复到别处时用 -backup-restore-root 显式放开",
+			"restore_roots", strings.Join(backupStatus.RestoreRoots, ","))
+	} else {
+		logger.Warn("恢复目标白名单已被显式放开，请确认这些目录是安全的恢复位置",
+			"restore_roots", strings.Join(backupStatus.RestoreRoots, ","))
+	}
+	if !backupStatus.CronAvailable {
+		logger.Warn("计划任务当前不可用，备份任务只能手动执行（面板其它功能不受影响）",
+			"reason", backupStatus.CronReason)
+	}
+
 	srv, err := server.New(server.Options{
 		Addr:      bootstrap.Config.Addr,
 		Logger:    logger,
@@ -1010,6 +1114,7 @@ func run() error {
 		Firewall:     firewallManager,
 		Terminal:     terminalManager,
 		Cron:         cronManager,
+		Backup:       backupManager,
 	})
 	if err != nil {
 		return err

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"lipanel/internal/auth"
+	"lipanel/internal/cron"
 	"lipanel/internal/file"
 	"lipanel/internal/firewall"
 	"lipanel/internal/plugin"
@@ -119,6 +120,20 @@ type Options struct {
 	// 而不是因为一个终端让整个面板起不来
 	// （见 internal/terminal/errors.go 的优雅降级说明）。
 	Terminal *terminal.Manager
+
+	// Cron 是计划任务（crontab）管理器（阶段五 5.2，核心自带）。
+	//
+	// 为 nil 时 /api/cron 返回 503（而不是 panic）：与 4.1~4.6、5.1 一致，
+	// 只关心其它功能的测试无需构造它。
+	//
+	// ########## 与其它模块最重要的区别：它改的是「未来的执行计划」 ##########
+	//
+	// 4.1~4.6 的操作后果发生在**按下按钮的那一刻**；本模块的后果发生在
+	// 未来某个无人值守的时刻。写坏了不会立刻报错，而是要等到
+	// 那次任务该跑的时候才发现（而备份任务失败的发现周期是以天计的）。
+	// 因此它比其它模块更依赖「先备份、失败回滚、命令原文进审计」这三件事，
+	// 具体实现见 internal/cron/manager.go 的固定时序注释。
+	Cron *cron.Manager
 }
 
 // Server 封装 HTTP 服务及其依赖。
@@ -137,6 +152,7 @@ type Server struct {
 	storeMgr     *store.Manager
 	firewallMgr  *firewall.Manager
 	terminalMgr  *terminal.Manager
+	cronMgr      *cron.Manager
 	handler      http.Handler
 	httpSrv      *http.Server
 }
@@ -208,6 +224,14 @@ func New(opts Options) (*Server, error) {
 	// Windows 等无 PTY 平台上 Manager 仍可构造，但创建会话会返回
 	// ErrUnsupported——降级判断在 terminal 包内，这里不重复判断。
 	s.terminalMgr = opts.Terminal
+
+	// 计划任务（阶段五 5.2）：同上。未注入时 /api/cron 返回 503。
+	//
+	// 特别注意：默认的 commandStore 会**真实调用 crontab 命令**改写
+	// 面板运行身份的 crontab。因此测试与端到端验证一律注入
+	// fileStore（-cron-file / Options.FilePath），绝不让测试碰宿主机 crontab
+	// ——与 4.6 的假执行器、4.5 的 LIPANEL_STORE_* 同一纪律。
+	s.cronMgr = opts.Cron
 
 	mux := http.NewServeMux()
 	// 服务路由由 registerAPIRoutes 内部统一注册（核心自带功能，

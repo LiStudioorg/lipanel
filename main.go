@@ -33,6 +33,7 @@ import (
 
 	"lipanel/internal/auth"
 	"lipanel/internal/config"
+	"lipanel/internal/cron"
 	"lipanel/internal/file"
 	"lipanel/internal/firewall"
 	"lipanel/internal/plugin"
@@ -217,6 +218,28 @@ func run() error {
 			"允许连接 Web 终端的额外 Origin 白名单（逗号分隔，如 https://panel.example.com）。"+
 				"**默认只允许同源**：WebSocket 不受同源策略保护且浏览器会自动携带 Cookie，"+
 				"因此必须校验 Origin 防 CSWSH。仅当面板与页面确实跨域时才需要配置")
+
+		// ---------- 计划任务 crontab（阶段五 5.2）----------
+		cronFile = flag.String("cron-file", "",
+			"**隔离文件模式**：把 crontab 的读写重定向到一个普通文件，绝不碰系统 crontab。"+
+				"用于开发、端到端验证与 CI（安全红线：写 crontab 的测试必须隔离）。"+
+				"留空则操作**面板运行身份**的 crontab")
+		cronUser = flag.String("cron-user", "",
+			"用 crontab -u <user> 管理指定用户的 crontab（留空 = 当前运行用户，不加 -u）。"+
+				"面板改自己的任务、系统 cron 不受影响才是安全的默认值；"+
+				"想管理别的用户必须显式声明，且状态接口与列表会写明在改谁的任务")
+		cronDataDir = flag.String("cron-data-dir", cron.DefaultDataDir,
+			"计划任务数据目录：包装脚本 jobs/<id>.sh、执行日志 logs/<id>.log、"+
+				"改动前的备份 backups/（权限 0700）。删除任务时对应脚本一并清理")
+		cronTimeout = flag.Duration("cron-timeout", cron.DefaultCommandTimeout,
+			"单次 crontab 命令的超时（默认 10s）。crontab 是瞬时完成的本地操作，"+
+				"超时说明磁盘或 PAM 出问题了，等再久也不会变好，因此取短值")
+		cronLogMax = flag.Int64("cron-log-max-bytes", cron.DefaultLogMaxBytes,
+			"单个任务执行日志的体积上限（默认 2MiB），超出后原地截断并保留最近部分。"+
+				"没有上限的话一个刷屏的死循环任务能写出几百 MB 日志")
+		cronBackupKeep = flag.Int("cron-backup-keep", cron.DefaultBackupKeep,
+			"保留的 crontab 备份份数（默认 10）。每次写操作前都会备份改前内容，"+
+				"不清理的话一年下来目录里会有几万个文件")
 	)
 	flag.Parse()
 
@@ -912,6 +935,61 @@ func run() error {
 		embeddedBuilt = webBuilt()
 	}
 
+	// ---------- 计划任务 crontab（阶段五 5.2，核心自带）----------
+	//
+	// 审计同样是「统一落盘、分别查询」：与其它八个审计器共用同一个
+	// -audit-log 文件（JSONL 追加写），但有独立类型、环形缓冲与查询接口
+	// （/api/cron/audit），互不污染。
+	cronAuditor, err := cron.NewAuditor(cron.AuditOptions{
+		Capacity: *pluginAuditBuf,
+		Path:     *pluginAuditLog,
+		Logger:   logger,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化计划任务审计失败: %w", err)
+	}
+	defer func() { _ = cronAuditor.Close() }()
+
+	cronManager, err := cron.NewManager(cron.Options{
+		FilePath:       *cronFile,
+		CrontabUser:    *cronUser,
+		DataDir:        *cronDataDir,
+		CommandTimeout: *cronTimeout,
+		LogMaxBytes:    *cronLogMax,
+		BackupKeep:     *cronBackupKeep,
+		Logger:         logger,
+		Auditor:        cronAuditor,
+	})
+	if err != nil {
+		// 目录建不起来（权限、只读文件系统）是真实的配置错误，
+		// 必须明确报错，而不是让用户以为任务保存成功了。
+		return fmt.Errorf("初始化计划任务管理器失败: %w", err)
+	}
+
+	// ########## 启动时只读探测，且**不做任何写操作** ##########
+	//
+	// 面板绝不能在启动时改写 crontab：那会让"重启面板"这件无害的事
+	// 变成一次对系统定时任务的写入。探测只是读（读不到也只是标
+	// available=false），并且**不阻断启动**——没装 cron 的机器上，
+	// 面板的其它全部功能必须照常可用（与 4.1~4.6 一致的降级策略）。
+	cronStatus := cronManager.Status(bootstrapCtx())
+	if cronManager.Mode() == cron.ModeFile {
+		logger.Warn("计划任务处于【隔离文件模式】：所有读写都落在 "+*cronFile+
+			"，不会触碰系统 crontab。仅用于开发、验证与 CI",
+			"file", *cronFile, "data_dir", *cronDataDir)
+	} else if cronStatus.Available {
+		logger.Info("计划任务管理已就绪",
+			"target", cronStatus.Target, "data_dir", *cronDataDir,
+			"user", cronStatus.User)
+	} else {
+		logger.Warn("计划任务当前不可用，面板其它功能不受影响",
+			"reason", cronStatus.Reason)
+	}
+	if *cronUser != "" {
+		logger.Warn("计划任务正在管理**其它用户**的 crontab，请确认这是有意为之",
+			"cron_user", *cronUser)
+	}
+
 	srv, err := server.New(server.Options{
 		Addr:      bootstrap.Config.Addr,
 		Logger:    logger,
@@ -931,6 +1009,7 @@ func run() error {
 		Store:        storeManager,
 		Firewall:     firewallManager,
 		Terminal:     terminalManager,
+		Cron:         cronManager,
 	})
 	if err != nil {
 		return err

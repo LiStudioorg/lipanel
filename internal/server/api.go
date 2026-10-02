@@ -165,6 +165,42 @@ func (s *Server) registerAPIRoutes(mux *http.ServeMux) {
 	// ⚠️ 该注册函数内部有**顺序要求**（固定段路由必须先于通配注册），
 	// 已由 registerBackupRoutes 集中处理。
 	s.registerBackupRoutes(mux)
+
+	// ---------- 日志查看（阶段五 5.4.1，核心自带）----------
+	//
+	// 与 4.1~4.6、5.1~5.3 同一套架构：logs_api.go 承载 handler，
+	// internal/logs 承载日志源白名单、journalctl argv 组装、文件读取、
+	// 行过滤、权限与审计。
+	//
+	// ########## 本模块在接口层与其它模块的区别 ##########
+	//
+	// ① **查询绝不接受任意路径**。日志源必须是白名单内的 ID
+	//    （system / nginx-access / nginx-error），文件路径由启动时
+	//    的源探测决定，运行时不接受任何 path 类参数——否则 ?path=
+	//    就是一个「登录即可读这台机器任意文件」的入口。
+	//
+	// ② **可用性是「源」的，不是模块的**。面板启动时各源逐个探测可用性，
+	//    sources 接口返回 available=false + 原因（如未装 journald / 无 nginx）。
+	//
+	// ③ **行内容全部原文返回**。转义在前端（<pre> + 文本节点，禁用 v-html）。
+	s.registerLogRoutes(mux)
+
+	// ---------- 通知渠道（阶段五 5.4.2，核心自带）----------
+	//
+	// 与 4.1~4.6、5.1~5.3、5.4.1 同一套架构：notify_api.go 承载 handler，
+	// internal/notify 承载凭证加密（HKDF 派生 AES-GCM）、渠道 CRUD、
+	// 四类渠道发送、失败重试、权限与审计。
+	//
+	// ########## 本模块在接口层与其它模块的区别 ##########
+	//
+	// ① **凭证既不回显也不进审计。** 列表返回脱敏视图（has_secret 布尔）；
+	//    编辑时请求里密文字段为空串表示"不改动"。
+	//    这是本模块的硬约束：webhook 的真正 token、SMTP 密码、Telegram
+	//    token 绝不能出现在任何响应、任何审计记录、任何错误信息里。
+	//
+	// ② **测试发送可针对单渠道或全部启用渠道**（?channel=xxx 为空则全部）。
+	//    结果如实报告 sent/failed，失败原因用脱敏文本。
+	s.registerNotifyRoutes(mux)
 }
 
 // healthResponse 是 /api/health 的响应体，字段使用 snake_case 以便前端直接消费。

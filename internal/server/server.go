@@ -20,6 +20,8 @@ import (
 	"lipanel/internal/cron"
 	"lipanel/internal/file"
 	"lipanel/internal/firewall"
+	"lipanel/internal/logs"
+	"lipanel/internal/notify"
 	"lipanel/internal/plugin"
 	"lipanel/internal/service"
 	"lipanel/internal/site"
@@ -149,6 +151,29 @@ type Options struct {
 	// Cron 为 nil 时备份任务仍可保存并手动执行，只是不会定时跑
 	// （状态接口会如实说明原因，见 internal/backup/cronlink.go）。
 	Backup *backup.Manager
+	// Logs 是日志查看管理器（阶段五 5.4.1，核心自带）。
+	//
+	// 为 nil 时 /api/logs 返回 503（而不是 panic）：与 4.1~4.6、5.1~5.3
+	// 一致，只关心其它功能的测试无需构造它。
+	//
+	// ########## 与其它模块最重要的区别：可用性是「源」的，不是模块的 ##########
+	//
+	// 本模块管理器**始终可构造**（即使本机没有 journald、没有 nginx），
+	// 但日志源的可用性是逐个探测的——哪个源不可用，sources 接口会
+	// 给那个源打 available=false + 原因。Manager 为 nil 只意味着
+	// 「整个日志功能被禁用」，与「某几个源不可用」是两件不同的事。
+	Logs *logs.Manager
+	// Notify 是通知渠道管理器（阶段五 5.4.2，核心自带）。
+	//
+	// 为 nil 时 /api/notify 返回 503（而不是 panic）：与其它模块一致，
+	// 只关心其它功能的测试无需构造它。
+	//
+	// ########## 本模块的凭证安全纪律 ##########
+	//
+	// 各渠道的敏感字段（SMTP 密码、webhook token、Telegram token）
+	// 用 AES-256-GCM（密钥由 auth.jwt_secret 经 HKDF 派生）加密后落盘，
+	// 列表接口只返回脱敏视图，明文凭证绝不被回显、绝不进审计/日志。
+	Notify *notify.Manager
 }
 
 // Server 封装 HTTP 服务及其依赖。
@@ -169,6 +194,8 @@ type Server struct {
 	terminalMgr  *terminal.Manager
 	cronMgr      *cron.Manager
 	backupMgr    *backup.Manager
+	logsMgr      *logs.Manager
+	notifyMgr    *notify.Manager
 	handler      http.Handler
 	httpSrv      *http.Server
 }
@@ -256,6 +283,19 @@ func New(opts Options) (*Server, error) {
 	// 恢复目标白名单全部指向临时目录，本地存储也只用临时目录
 	// （绝不碰宿主机的备份目录与云存储）——与 5.2 的 -cron-file 同一纪律。
 	s.backupMgr = opts.Backup
+
+	// 日志查看（阶段五 5.4.1）：同上。未注入时 /api/logs 返回 503。
+	//
+	// 注意与其它模块的区别：日志管理器**始终可构造**（不管本机有没有
+	// journald 或 nginx），可用性按源逐个探测。因此这里注入与否
+	// 决定的是「整个日志模块开不开」，而不是「哪些源可用」。
+	s.logsMgr = opts.Logs
+
+	// 通知渠道（阶段五 5.4.2，核心自带）。未注入时 /api/notify 返回 503。
+	//
+	// 特别注意：凭证安全是本模块的硬约束 — 加密落盘、脱敏回显、不进审计。
+	// Manager 若未配置 MasterSecret，会拒绝把凭证落盘（见 notify.New 的告警）。
+	s.notifyMgr = opts.Notify
 
 	mux := http.NewServeMux()
 	// 服务路由由 registerAPIRoutes 内部统一注册（核心自带功能，

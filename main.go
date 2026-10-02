@@ -37,6 +37,8 @@ import (
 	"lipanel/internal/cron"
 	"lipanel/internal/file"
 	"lipanel/internal/firewall"
+	"lipanel/internal/logs"
+	"lipanel/internal/notify"
 	"lipanel/internal/plugin"
 	"lipanel/internal/server"
 	"lipanel/internal/service"
@@ -74,6 +76,12 @@ func webBuilt() bool {
 
 // version 可在构建时通过 -ldflags "-X main.version=..." 注入。
 var version = "dev"
+
+// defaultNotifyStorePath 是通知渠道存储文件的默认位置。
+// 与 backup/-store-state-dir 等一脉相承地放在 /var/lib/lipanel 下。
+func defaultNotifyStorePath() string {
+	return "/var/lib/lipanel/notify.json"
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -279,6 +287,21 @@ func run() error {
 			"单次打包的条目数上限（默认 100 万）。防的是「几百万个小文件」把打包拖到以小时计")
 		backupMaxHistory = flag.Int("backup-max-history", backup.DefaultMaxHistoryEntries,
 			"每个备份任务保留的历史条数（默认 500），超出后截断最早的")
+
+		// ---------- 日志查看（五阶段 5.4.1）----------
+		logsTimeout = flag.Duration("logs-timeout", logs.DefaultQueryTimeout,
+			"单次日志查询的超时（默认 15s）。journalctl / 读大文件都受此约束，避免拖垮面板")
+
+		// ---------- 通知渠道（五阶段 5.4.2）----------
+		notifyStorePath = flag.String("notify-store", defaultNotifyStorePath(),
+			"通知渠道配置（含加密后凭证）的存储文件路径（默认 $STATE_DIR/notify.json，0600）。"+
+				"留空则只在内存保存、不落盘")
+		notifyTimeout = flag.Duration("notify-timeout", notify.DefaultSendTimeout,
+			"单次渠道发送的超时（默认 10s）。webhook/Bot/邮件都受此约束")
+		notifyRetries = flag.Int("notify-retries", notify.DefaultRetryTimes,
+			"发送失败后的重试次数（默认 2，即最多尝试 3 次）")
+		notifyAuditLog = flag.String("notify-audit-log", "",
+			"通知操作审计日志路径（JSONL，追加写入，0600）；留空则只保留在内存中")
 	)
 	flag.Parse()
 
@@ -1094,6 +1117,56 @@ func run() error {
 			"reason", backupStatus.CronReason)
 	}
 
+	// ---------- 日志查看（五阶段 5.4.1，核心自带）----------
+	//
+	// nginx 应用日志目录取自 site 模块探测到的 nginx prefix（<prefix>/logs）。
+	// 若面板没装 / 没探测到 nginx，则该目录为空，nginx 相关日志源不可用
+	// （这是"源不可用"，不是整模块不可用）。绝不在此拼接任意用户路径。
+	nginxLogsDir := ""
+	if siteManager.Adapter().Available() {
+		nginxLogsDir = filepath.Join(siteManager.Adapter().Prefix(), "logs")
+	}
+	logsAuditor, logsAuditErr := logs.NewAuditor(logs.AuditOptions{
+		Logger: logger,
+		Path:   *pluginAuditLog, // 与服务/文件/站点等核心模块共用同一份 JSONL（分别查询）
+	})
+	if logsAuditErr != nil {
+		return fmt.Errorf("初始化日志查看审计失败: %w", logsAuditErr)
+	}
+	logsManager, err := logs.New(logs.ManagerOptions{
+		NginxLogsDir: nginxLogsDir,
+		QueryTimeout: *logsTimeout,
+		Auditor:      logsAuditor,
+		Logger:       logger,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化日志查看模块失败: %w", err)
+	}
+	logger.Info("日志查看已就绪",
+		"nginx_logs_dir", nginxLogsDir,
+		"sources", len(logsManager.Sources()))
+
+	// ---------- 通知渠道（五阶段 5.4.2，核心自带）----------
+	//
+	// 凭证加密密钥由 auth.jwt_secret 经 HKDF 派生（见 internal/notify/crypto.go）。
+	// MasterSecret 为空（理论上配置里总有 jwt_secret）时，notify 会拒绝把凭证落盘。
+	notifyManager, err := notify.New(notify.NotifyOptions{
+		MasterSecret:  bootstrap.Config.Auth.JWTSecret,
+		StorePath:     *notifyStorePath,
+		SendTimeout:   *notifyTimeout,
+		RetryTimes:    *notifyRetries,
+		AuditCapacity: 0,
+		AuditPath:     *notifyAuditLog,
+		Logger:        logger,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化通知渠道模块失败: %w", err)
+	}
+	logger.Info("通知渠道已就绪",
+		"store_path", notifyManager.StorePath(),
+		"encryption", notifyManager.EncryptionEnabled(),
+		"channels", len(notifyManager.List()))
+
 	srv, err := server.New(server.Options{
 		Addr:      bootstrap.Config.Addr,
 		Logger:    logger,
@@ -1107,6 +1180,8 @@ func run() error {
 		Files:     fileManager,
 		Sites:     siteManager,
 		SSL:       sslManager,
+		Logs:      logsManager,
+		Notify:    notifyManager,
 		// 调度器单独注入：它是可选的（用户可能只想手动续期），
 		// 而状态接口需要在它不存在时也能正常返回。
 		SSLScheduler: sslScheduler,

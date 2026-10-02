@@ -74,6 +74,11 @@ const builtinMenus = [
   // 「恢复到目标」操作，必须随时可达，不能依赖插件机制。
   { key: 'backup', label: '备份与恢复', icon: '💾', to: { name: 'backup' } },
   { key: 'terminal', label: '终端', icon: '⌨️', to: { name: 'terminal' } },
+  // 日志查看（阶段五 5.4.1）：内置页面而非插件——排查故障时要看日志，
+  // 它必须像终端一样始终可达，不能依赖插件机制是否可用。
+  { key: 'logs', label: '日志查看', icon: '📄', to: { name: 'logs' } },
+  // 通知渠道（阶段五 5.4.2）：内置页面而非插件——告警能力随手可配。
+  { key: 'notify', label: '通知渠道', icon: '🔔', to: { name: 'notify' } },
   { key: 'plugins', label: '插件管理', icon: '🧩', to: { name: 'plugin-list' } },
   // 审计页（阶段三 3.3）：权限声明是"拒绝对了没"的唯一可见证据，
   // 因此把它放在一级菜单，而不是藏进插件详情里。
